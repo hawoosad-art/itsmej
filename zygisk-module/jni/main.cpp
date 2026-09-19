@@ -14,7 +14,7 @@
 #include "ipc_socket.h"
 #include "crash_guard.h"
 
-#define TAG "amkush/main"
+#define TAG "itsanon/main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -38,7 +38,7 @@ static void do_camera_hook_init(const char *via) {
         return;
     }
 
-    LOGI("=== amkush injection start  via=%s  pid=%d ===", via, (int)getpid());
+    LOGI("=== itsanon injection start  via=%s  pid=%d ===", via, (int)getpid());
 
     LOGI("[1/4] crash_guard_init ...");
     if (crash_guard_init() != 0) {
@@ -78,7 +78,7 @@ static void do_camera_hook_init(const char *via) {
     }
     LOGI("[4/4] ipc_socket_start OK");
 
-    LOGI("=== amkush virtual camera ACTIVE  via=%s ===", via);
+    LOGI("=== itsanon virtual camera ACTIVE  via=%s ===", via);
 }
 
 #include <dirent.h>

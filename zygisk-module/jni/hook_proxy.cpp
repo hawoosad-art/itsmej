@@ -19,7 +19,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define TAG "amkush/hook_proxy"
+#define TAG "itsanon/hook_proxy"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -93,7 +93,7 @@ static std::atomic<uint32_t> g_total_pcr_calls{0};
 static std::atomic<uint32_t> g_total_rob_calls{0};
 
 static void dump_diagnostics(void) {
-    LOGI("═══════════════ AMKUSH INJECTION DIAGNOSTICS ═══════════════");
+    LOGI("═══════════════ ITSANON INJECTION DIAGNOSTICS ═══════════════");
     LOGI("Injection enabled: %s", g_enabled.load() ? "YES" : "NO");
     bool _fs_init  = frame_source_initialized();
     bool _fs_ready = frame_source_ready();

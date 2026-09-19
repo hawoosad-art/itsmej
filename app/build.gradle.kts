@@ -11,15 +11,17 @@ val localProps = Properties().also { props ->
         ?.inputStream()?.use { props.load(it) }
 }
 
-val ffmpegDir: String? = localProps.getProperty("ffmpeg.dir") ?: System.getenv("FFMPEG_ROOT")
-val opensslDir: String? = localProps.getProperty("openssl.dir") ?: System.getenv("OPENSSL_ROOT")
+val gstreamerDir: String? = localProps.getProperty("gstreamer.dir") ?: System.getenv("GSTREAMER_ROOT")
+val libyuvDir: String? = localProps.getProperty("libyuv.dir") ?: System.getenv("LIBYUV_ROOT")
 
 android {
-    namespace  = "com.itsme.amkush"
+    namespace  = "com.itsme.itsanon"
     compileSdk = 35
+    // Match the LLVM toolchain used by the current GStreamer Android SDK.
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "com.itsme.amkush"
+        applicationId = "com.itsme.itsanon"
         minSdk        = 26
         targetSdk     = 35
         versionCode   = 2
@@ -43,19 +45,12 @@ android {
         }.getOrNull() ?: "unknown"
         buildConfigField("String", "FG_BUILD", "\"$fgBuild\"")
 
-        nd {
-            // arm64 or armeabi-v7a; add x86_64 back only when injector binaries
-            // are built for that ABI. Listing x86_64 caused the APK to install
-            // on emulators where injection then silently failed.
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-        }
-
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++14", "-frtti", "-fexceptions")
                 val args = mutableListOf<String>()
-                if (!ffmpegDir.isNullOrEmpty()) args += "-DFFMPEG_ROOT=$ffmpegDir"
-                if (!opensslDir.isNullOrEmpty()) args += "-DOPENSSL_ROOT=$opensslDir"
+                if (!gstreamerDir.isNullOrEmpty()) args += "-DGSTREAMER_ROOT=$gstreamerDir"
+                if (!libyuvDir.isNullOrEmpty()) args += "-DLIBYUV_ROOT=$libyuvDir"
                 // Bake the git branch + short SHA into libframe_producer.so so the
                 // FRESH-BUILD-CHECK banner in logcat proves which build is running.
                 val fgBranch = runCatching {
@@ -73,6 +68,17 @@ android {
         cmake {
             path    = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1+"
+        }
+    }
+
+    // Sideload builds are published per ABI so each device receives only its
+    // matching native libraries. Both currently supported ARM ABIs remain.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
         }
     }
 

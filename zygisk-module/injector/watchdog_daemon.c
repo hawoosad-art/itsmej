@@ -27,7 +27,7 @@ static char g_log_path[512];
 static char g_stop_path[512];
 
 
-    #define WLOG_TAG "amkush/watchdog"
+    #define WLOG_TAG "itsanon/watchdog"
     static void wlog(const char *fmt, ...) __attribute__((format(printf,1,2)));
     static void wlog(const char *fmt, ...) {
       va_list ap; va_start(ap, fmt);
@@ -87,7 +87,7 @@ static pid_t get_cameraserver_pid(void) {
 }
 
 /* V4.9.16 liveness probe: is the hook actually serving frames?
- * The abstract AF_UNIX socket "\0amkush_frame_fd" is bound ONLY by libhookProxy,
+ * The abstract AF_UNIX socket "\0itsanon_frame_fd" is bound ONLY by libhookProxy,
  * and only once its detached init thread has finished. A hook mapping alone does
  * not prove the injection works — if init fails, the .so stays mapped but nothing
  * binds the socket, and frame_producer gets "Connection refused". Abstract sockets
@@ -99,7 +99,7 @@ static int hook_socket_live(void) {
     char line[512];
     int found = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "@amkush_frame_fd")) {
+        if (strstr(line, "@itsanon_frame_fd")) {
             found = 1;
             break;
         }
@@ -201,7 +201,7 @@ static int run_injector(pid_t target_pid) {
               if (c == '\n' || pos >= (int)sizeof(linebuf) - 1) {
                   linebuf[pos] = '\0';
                   if (pos > 0)
-                      __android_log_print(ANDROID_LOG_INFO, "amkush/injector",
+                      __android_log_print(ANDROID_LOG_INFO, "itsanon/injector",
                                           "%s", linebuf);
                   pos = 0;
               } else {
@@ -210,7 +210,7 @@ static int run_injector(pid_t target_pid) {
           }
           if (pos > 0) {
               linebuf[pos] = '\0';
-              __android_log_print(ANDROID_LOG_INFO, "amkush/injector", "%s", linebuf);
+              __android_log_print(ANDROID_LOG_INFO, "itsanon/injector", "%s", linebuf);
           }
           close(pipefd[0]);
       }
@@ -259,7 +259,7 @@ int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr,
             "Usage: %s <injector_path> <hook_lib_path> <log_path>\n"
-            "  injector_path  — path to amkush_injector64 or amkush_injector32\n"
+            "  injector_path  — path to itsanon_injector64 or itsanon_injector32\n"
             "  hook_lib_path  — path to libhookProxy.so\n"
             "  log_path       — file to write daemon logs into\n",
             argv[0]);

@@ -1,8 +1,8 @@
 #!/system/bin/sh
-    # service.sh — ptrace injection into cameraserver via amkush_injector
+    # service.sh — ptrace injection into cameraserver via itsanon_injector
     #
     # Logging: ALL output goes to Android logcat only. No file I/O.
-    #   Monitor: adb logcat -s 'amkush/service:V' 'amkush/injector:V'
+    #   Monitor: adb logcat -s 'itsanon/service:V' 'itsanon/injector:V'
     #
     # WHY NOT LD_PRELOAD:
     #   AOSP 'neverallow init *:process noatsecure' makes wrap.<service> + LD_PRELOAD
@@ -11,7 +11,7 @@
     #   init, not forked from zygote.
     #
     # INSTEAD: we ptrace-attach to the already-running cameraserver and
-    #   remote-dlopen libhookProxy.so via amkush_injector (AndKittyInjector --pid).
+    #   remote-dlopen libhookProxy.so via itsanon_injector (AndKittyInjector --pid).
     #   This needs no wrap property, no restart, and no reboot.
     #
     # SELinux: enforcement is disabled for the injection window and immediately
@@ -40,8 +40,8 @@
     # ── Logcat helpers ────────────────────────────────────────────────────────────
     # /system/bin/log is toybox on all Android 5.0+ (API 21+).
     # Priority flags: v=verbose  d=debug  i=info  w=warn  e=error
-    # Monitor all FaceGate events:  adb logcat -s 'amkush/*:V'
-    _LOG_TAG="amkush/service"
+    # Monitor all FaceGate events:  adb logcat -s 'itsanon/*:V'
+    _LOG_TAG="itsanon/service"
     log_i() { /system/bin/log -t "$_LOG_TAG" -p i -- "$*" 2>/dev/null || true; }
     log_w() { /system/bin/log -t "$_LOG_TAG" -p w -- "$*" 2>/dev/null || true; }
     log_e() { /system/bin/log -t "$_LOG_TAG" -p e -- "$*" 2>/dev/null || true; }
@@ -91,13 +91,13 @@
     ABI=$(getprop ro.product.cpu.abi)
     case "$ABI" in
       arm64-v8a)
-          INJECTOR="$MODDIR/system/bin/amkush_injector64"
-          [ -f "$INJECTOR" ] || INJECTOR="$MODDIR/system/bin/amkush_injector"
+          INJECTOR="$MODDIR/system/bin/itsanon_injector64"
+          [ -f "$INJECTOR" ] || INJECTOR="$MODDIR/system/bin/itsanon_injector"
           HOOK="$MODDIR/system/lib64/libhookProxy.so"
           ;;
       armeabi-v7a|armeabi)
-          INJECTOR="$MODDIR/system/bin/amkush_injector32"
-          [ -f "$INJECTOR" ] || INJECTOR="$MODDIR/system/bin/amkush_injector"
+          INJECTOR="$MODDIR/system/bin/itsanon_injector32"
+          [ -f "$INJECTOR" ] || INJECTOR="$MODDIR/system/bin/itsanon_injector"
           HOOK="$MODDIR/system/lib/libhookProxy.so"
           ;;
       *)
@@ -110,7 +110,7 @@
     log_i "hook lib=$HOOK"
 
     if [ ! -f "$INJECTOR" ]; then
-      log_e "amkush_injector binary not found: $INJECTOR"
+      log_e "itsanon_injector binary not found: $INJECTOR"
       echo "not_found" > "$MODDIR/facegate/safety_state"
       exit 0
     fi
@@ -222,10 +222,10 @@
           log_i "SELinux: left at $prev_selinux (was not enforcing)"
       fi
 
-      # Emit each injector output line to logcat (tag: amkush/injector)
+      # Emit each injector output line to logcat (tag: itsanon/injector)
       if [ -n "$INJECT_OUT" ]; then
           echo "$INJECT_OUT" | while IFS= read -r _line; do
-              [ -n "$_line" ] && /system/bin/log -t amkush/injector -p i -- "$_line" 2>/dev/null || true
+              [ -n "$_line" ] && /system/bin/log -t itsanon/injector -p i -- "$_line" 2>/dev/null || true
           done
       fi
       log_i "Injector rc=$rc"
@@ -339,5 +339,5 @@
     ) &
 
     log_i "=== service.sh complete (watchdog running in background) ==="
-    log_i "=== Monitor: adb logcat -s 'amkush/*:V' ==="
+    log_i "=== Monitor: adb logcat -s 'itsanon/*:V' ==="
     

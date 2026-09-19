@@ -12,7 +12,7 @@ allow cameraserver unlabeled file { read open getattr execute map }
 allow cameraserver unlabeled dir { read open search getattr }
 
 # ── ptrace-based injection ────────────────────────────────────────────────────
-# amkush_injector (AndKittyInjector --pid) runs as root shell / magisk domain
+# itsanon_injector (AndKittyInjector --pid) runs as root shell / magisk domain
 # and ptrace-attaches to cameraserver to remote-dlopen libhookProxy.so.
 # This replaces LD_PRELOAD + noatsecure which cannot be granted on Android 10+.
 allow su      cameraserver process { ptrace }

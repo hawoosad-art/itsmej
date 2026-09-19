@@ -1,6 +1,6 @@
 #pragma once
 
-#define AMKUSH_SOCKET_NAME  "\0amkush_frame_fd"
+#define ITSANON_SOCKET_NAME  "\0itsanon_frame_fd"
 
 #ifdef __cplusplus
 extern "C" {

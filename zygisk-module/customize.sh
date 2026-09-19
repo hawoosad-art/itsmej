@@ -24,11 +24,11 @@ on_install() {
     unzip -o "$ZIPFILE" 'post-fs-data.sh' -d "$MODPATH" >&2
     unzip -o "$ZIPFILE" 'sepolicy.rule' -d "$MODPATH" >&2
 
-    # amkush_injector (ptrace-based, AndKittyInjector) — one binary per ABI,
+    # itsanon_injector (ptrace-based, AndKittyInjector) — one binary per ABI,
     # lives under system/bin so it's already extracted by the 'system/*'
     # unzip above. We just verify it made it in and chmod it explicitly
     # since executables need 0755 regardless of the recursive perm pass below.
-    for BIN in "$MODPATH/system/bin/amkush_injector64" "$MODPATH/system/bin/amkush_injector32"; do
+    for BIN in "$MODPATH/system/bin/itsanon_injector64" "$MODPATH/system/bin/itsanon_injector32"; do
         if [ -f "$BIN" ]; then
             chmod 0755 "$BIN"
             ui_print "- Injector binary: $(basename "$BIN") ✓"
@@ -94,7 +94,7 @@ on_install() {
     set_perm "$MODPATH/sepolicy.rule" root root 0644
 
     # Injector binaries (ptrace-based, run as root shell processes)
-    for BIN in "$MODPATH/system/bin/amkush_injector64" "$MODPATH/system/bin/amkush_injector32"; do
+    for BIN in "$MODPATH/system/bin/itsanon_injector64" "$MODPATH/system/bin/itsanon_injector32"; do
         [ -f "$BIN" ] && set_perm "$BIN" root root 0755
     done
 

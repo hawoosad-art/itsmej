@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project("amkush_hook" CXX C)
+project("itsanon_hook" CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,9 +17,9 @@ set(CMAKE_C_FLAGS            "${CMAKE_C_FLAGS}   -fno-sanitize=cfi -fvisibility=
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static-libstdc++")
 
 # ── Source files ────────────────────────────────────────────────────────────
-# NOTE: main.cpp no longer includes zygisk.hpp. The Zygisk AmkushModule and
+# NOTE: main.cpp no longer includes zygisk.hpp. The Zygisk ItsAnonModule and
 # REGISTER_ZYGISK_MODULE have been removed. This library is now injected
-# exclusively via ptrace (amkush_injector / AndKittyInjector --pid).
+# exclusively via ptrace (itsanon_injector / AndKittyInjector --pid).
 # NOTE: license/license_client.cpp was REMOVED from the hook build. It was
 # dead code (never called by any hook source) and it embedded the HMAC
 # secret + plaintext server URL into libhookProxy.so — a binary that runs
@@ -187,6 +187,6 @@ set_target_properties(hookProxy PROPERTIES OUTPUT_NAME "hookProxy")
 message(STATUS "hookProxy configured — ABI=${ANDROID_ABI} (Zygisk: REMOVED, ShadowHook: STATIC, C++STL: STATIC)")
 
 # [V53] native root-hide engine — pure-syscall cloak binary shipped as an asset
-add_executable(amkush_cloak cloak_main.cpp)
-target_compile_options(amkush_cloak PRIVATE -fPIE)
-target_link_options(amkush_cloak PRIVATE -static-libstdc++ -pie)
+add_executable(itsanon_cloak cloak_main.cpp)
+target_compile_options(itsanon_cloak PRIVATE -fPIE)
+target_link_options(itsanon_cloak PRIVATE -static-libstdc++ -pie)

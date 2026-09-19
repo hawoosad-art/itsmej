@@ -1,9 +1,9 @@
-/* amkush_cloak — [V34] native root-hide engine. Pure syscalls, no Kotlin,
+/* itsanon_cloak — [V34] native root-hide engine. Pure syscalls, no Kotlin,
  * no shell: enters the TARGET app's mount namespace and cleans it from the
  * inside so every native detector (mountinfo reads, stat/exec of su, dir
  * probes) sees a stock phone.
  *
- * usage: amkush_cloak <pid>
+ * usage: itsanon_cloak <pid>
  *
  * Kotlin only invokes this binary; the hiding itself lives here, at the
  * syscall layer — the only place it can be done reliably.
@@ -20,8 +20,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define DUMMY     "/data/local/tmp/.amkush_dummy"
-#define EMPTY_DIR "/data/local/tmp/.amkush_empty"
+#define DUMMY     "/data/local/tmp/.itsanon_dummy"
+#define EMPTY_DIR "/data/local/tmp/.itsanon_empty"
 
 static int has_ci(const char *hay, const char *needle) {
     if (!hay) return 0;
@@ -69,7 +69,7 @@ static int looks_rooty(const char *mp) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: amkush_cloak <pid>\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: itsanon_cloak <pid>\n"); return 2; }
     pid_t pid = (pid_t)atoi(argv[1]);
     if (pid <= 0) return 2;
 

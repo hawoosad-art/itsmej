@@ -6,7 +6,7 @@
 - PAT (laroi254, itsme5+Workflow): `ghp_***REDACTED***`
 - Logs repo: `Amkushu999/Mylogs` (one branch per device). PAT (decoded XOR-0x5A from `app/src/main/cpp/activation.cpp`): `ghp_***REDACTED***`. Branches were emptied/deleted on user request; devices recreate them on upload (currently `13.unisoc.1`, `14.mediatek.1`).
 - NOTE: workspace `.git/config` remotes get stripped between turns (they hold the PAT) — re-add origin with the PAT before pushing.
-- Architecture: app (com.itsme.amkush) runs GStreamer producer → ashmem ring (FrameSourceHeader 64B: pan/zoom/source_rotation/manual_rotation/chroma_override). Zygisk module in cameraserver (libhookProxy.so) injects frames via hooked returnOutputBuffers; YUV path = Fix1 rotation + Fix3 AR-crop + libyuv NV12Scale (bilinear) + V10 unsharp; BLOB path = inject_jpeg (turbojpeg).
+- Architecture: app (com.itsme.itsanon) runs GStreamer producer → ashmem ring (FrameSourceHeader 64B: pan/zoom/source_rotation/manual_rotation/chroma_override). Zygisk module in cameraserver (libhookProxy.so) injects frames via hooked returnOutputBuffers; YUV path = Fix1 rotation + Fix3 AR-crop + libyuv NV12Scale (bilinear) + V10 unsharp; BLOB path = inject_jpeg (turbojpeg).
 - Log header: `Version : <branch> <sha> <INJECTOR_VERSION>` (DeviceUtils.kt). Injector .so has its own FRAME_INJECT_VERSION string (was stale at V9 in the V10 build — now kept in sync at V11).
 
 ## Devices
@@ -37,7 +37,7 @@ New evidence (full_facegate_log_14.txt @ 235da71, stock camera, LOCAL file 1080x
 - **Blue preview + whitish recording** = the YV12 branch swapped U/V per spec (planes[1]=V) but the MTK HAL's lockPlanes returns normalized order (planes[1]=U) → we wrote chroma swapped. V12: normalized default, raw swap behind chroma_override==1.
 - **Slow motion** = appsink sync=FALSE on local file → decode pace < realtime on mt6765 + injector stalls (1–1.7 s gaps inside inject). V12: sync=TRUE for non-live.
 - **Photo shows real frame**: BLOB (0x21 role=3) configured in stream_map but ZERO inject_jpeg/ROB fires for it — JPEG returns via processCaptureResult, whose hook is a deref-free metadata observer (PCR injection crashed cameraserver before — SEGV history). Left as known limitation; needs a careful PCR-injection rework, not a blind change.
-- Tombstone (14.mediatek.2): app-process crash at startup (SIGSEGV null pc in ART AttachCurrentThread, thread 'ssioncontroller', uid=app) — not cameraserver, no amkush native frames; likely app-side, unrelated to injector.
+- Tombstone (14.mediatek.2): app-process crash at startup (SIGSEGV null pc in ART AttachCurrentThread, thread 'ssioncontroller', uid=app) — not cameraserver, no itsanon native frames; likely app-side, unrelated to injector.
 - Rotation: this local video needs 90/270 (screenshots sideways at total 0) — media-dependent; overlay rotate buttons are the control for it. Defaults now: live=180 (V11), static=0 (V10).
 - Shipped: V11 4a4815c (live-180, per-device preview semiplanar chroma, snapshot LOGI traces), V12 8c94700 (pace + YV12 order). Builds via Workflow dispatch, chroma inputs nv12/nv12.
 
@@ -55,8 +55,8 @@ Log @ 4a4815c (V11 — note: V12 not installed there yet; pace/YV12 fixes untest
 - ~~Deployment issue~~ **WRONG — corrected below.** (Also wrong: "Zygisk module" — injection is PURE IN-APP PTRACE, no module; the "check Zygisk module" toast text was legacy and is fixed in V14.)
 
 ## 2026-09-03 — A11 root cause CORRECTED (user pushback was right)
-- Log proof hook WAS injected & ACTIVE: `injectNow: post-lock check — hook already active in pid=18386, skipping`; app "ACTIVE" status = liveness of `@amkush_frame_fd` in /proc/net/unix (bound by hook).
-- Real bug: kernel on this MTK/A11 blocks `setenforce 0` (known — grantSelinuxForInjection comment says so), and the live sepolicy rules covered ONLY injection (lib load/ptrace/execmem), NOT the app→cameraserver IPC: connect to `\0amkush_frame_fd` = EACCES ×120 ⇒ "failed" toast, zero injection despite active hook.
+- Log proof hook WAS injected & ACTIVE: `injectNow: post-lock check — hook already active in pid=18386, skipping`; app "ACTIVE" status = liveness of `@itsanon_frame_fd` in /proc/net/unix (bound by hook).
+- Real bug: kernel on this MTK/A11 blocks `setenforce 0` (known — grantSelinuxForInjection comment says so), and the live sepolicy rules covered ONLY injection (lib load/ptrace/execmem), NOT the app→cameraserver IPC: connect to `\0itsanon_frame_fd` = EACCES ×120 ⇒ "failed" toast, zero injection despite active hook.
 - V14 (cb5b5f5): ipcSelinuxRules() adds `allow untrusted_app(_all) cameraserver unix_stream_socket connectto/sendto`, `allow cameraserver untrusted_app(_all) fd use` + socket recv/send + ashmem r/w/map; applied at fresh injection AND on already-active skip branch; toast text corrected. Build dispatched.
 - Verification markers on A11 V14: `applyLivePolicyRules(...) applied via magiskpolicy`, then `Sent Ashmem fd=… to cameraserver hook after N attempt(s)`, then inject_yuv lines.
 

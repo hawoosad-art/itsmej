@@ -32,7 +32,7 @@ This was abandoned because:
 
 ### Current approach: ptrace injection
 
-`service.sh` uses **[amkush_injector](injector/AndKittyInjector)** — a
+`service.sh` uses **[itsanon_injector](injector/AndKittyInjector)** — a
 vendored, patched build of
 [AndKittyInjector](https://github.com/MJx0/AndKittyInjector) (ptrace-based
 Android library injector, built on
@@ -41,10 +41,10 @@ to the **already-running** `cameraserver` process and remote-`dlopen()`
 `libhookProxy.so` into it:
 
 ```sh
-amkush_injector --pid <cameraserver-pid> --libs /path/to/libhookProxy.so --memfd
+itsanon_injector --pid <cameraserver-pid> --libs /path/to/libhookProxy.so --memfd
 ```
 
-- **`--pid`** is an amkush-specific patch on top of upstream AndKittyInjector
+- **`--pid`** is an itsanon-specific patch on top of upstream AndKittyInjector
   (which only supports `--package <name>`, since it's built for injecting
   into apps). Native daemons like `cameraserver` have no package name, so we
   added raw-PID targeting that bypasses package resolution entirely — see
@@ -90,6 +90,6 @@ or from the watchdog's re-injection attempts.
 | `service.sh` | Waits for `cameraserver`, ptrace-injects the hook, runs the re-injection watchdog |
 | `post-fs-data.sh` | Early-boot manager detection + SELinux labeling |
 | `sepolicy.rule` | Grants file access + `ptrace` (no `noatsecure`) |
-| `customize.sh` | Magisk/KernelSU/APatch installer script; extracts `amkush_injector{32,64}` to `system/bin` |
+| `customize.sh` | Magisk/KernelSU/APatch installer script; extracts `itsanon_injector{32,64}` to `system/bin` |
 | `jni/main.cpp` | `libhookProxy.so` — ELF constructor (ptrace-injected) + Zygisk fallback for app processes |
 | `injector/AndKittyInjector`, `injector/KittyMemoryEx` | Vendored ptrace injector source, patched for `--pid` |

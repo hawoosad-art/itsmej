@@ -104,7 +104,7 @@
             android:foregroundServiceType="mediaPlayback|camera|dataSync"
             android:enabled="true">
             <intent-filter>
-                <action android:name="com.itsme.amkush.action.SURFACE_INJECTOR" />
+                <action android:name="com.itsme.itsanon.action.SURFACE_INJECTOR" />
             </intent-filter>
         </service>
 
@@ -126,7 +126,7 @@
             android:name=".notification.SafetyReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.itsme.amkush.ACTION_RESET_SAFETY" />
+                <action android:name="com.itsme.itsanon.ACTION_RESET_SAFETY" />
             </intent-filter>
         </receiver>
 
@@ -146,7 +146,7 @@
 
         <provider
             android:name=".ipc.FaceGateIpcProvider"
-            android:authorities="com.itsme.amkush.ipc"
+            android:authorities="com.itsme.itsanon.ipc"
             android:exported="true"
             android:enabled="true" />
 

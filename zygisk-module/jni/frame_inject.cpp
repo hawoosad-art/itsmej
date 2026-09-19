@@ -36,7 +36,7 @@ struct dma_buf_sync { uint64_t flags; };
 #include <libyuv.h>
 #include <turbojpeg.h>
 
-#define TAG "amkush/frame_inject"
+#define TAG "itsanon/frame_inject"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
@@ -48,7 +48,7 @@ struct dma_buf_sync { uint64_t flags; };
 // build-time default (-DUNISOC_23_CHROMA=nv12) + runtime override, instead of the
 // hard-coded NV21 that made the OPPO camera-app face blue. Also keeps V8's
 // quality: bilinear scale + native-res ring.
-#define FRAME_INJECT_VERSION "V84-AMKUSH.70-GZDROPBOX-20260914"
+#define FRAME_INJECT_VERSION "V84-ITSANON.70-GZDROPBOX-20260914"
 
 // FRAME_BUILD_ID — the exact git branch + commit SHA this .so was built from,
 // injected by the CI workflow (same value as HOOK_PROXY_VERSION). It is baked

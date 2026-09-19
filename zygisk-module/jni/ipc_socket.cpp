@@ -13,7 +13,7 @@
 #include <errno.h>
 #include <pthread.h>
 
-#define TAG "amkush/ipc_socket"
+#define TAG "itsanon/ipc_socket"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
@@ -85,9 +85,9 @@ static void *ipc_thread(void *) {
 
 
 
-    memcpy(addr.sun_path, AMKUSH_SOCKET_NAME, sizeof(AMKUSH_SOCKET_NAME) - 1);
+    memcpy(addr.sun_path, ITSANON_SOCKET_NAME, sizeof(ITSANON_SOCKET_NAME) - 1);
     socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path)
-                                    + sizeof(AMKUSH_SOCKET_NAME) - 1);
+                                    + sizeof(ITSANON_SOCKET_NAME) - 1);
 
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
@@ -139,7 +139,7 @@ static void *ipc_thread(void *) {
     }
 
 
-    LOGI("Listening on abstract socket '%s'", &AMKUSH_SOCKET_NAME[1]);
+    LOGI("Listening on abstract socket '%s'", &ITSANON_SOCKET_NAME[1]);
 
 
     {
