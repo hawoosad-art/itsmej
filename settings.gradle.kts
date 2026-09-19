@@ -19,7 +19,7 @@ dependencyResolutionManagement {
         maven {
             url = uri("https://jitpack.io")
         }
-        // FFmpeg Kit is published to Maven Central — no extra repo needed.
+        // GStreamer is built from source by the CI workflow; no Maven runtime is used.
         // (Removed: LibVLC Videolan repo, no longer used)
     }
 }

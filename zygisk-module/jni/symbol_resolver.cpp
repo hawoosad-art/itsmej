@@ -62,8 +62,10 @@ static const KnownSym ROB_KNOWN[] = {
     { "_ZN7android7camera320returnOutputBuffersEbRKNS_2spINS0_20NotificationListenerEEEPK22camera3_stream_buffer_tmllbNS_15SessionStatsBuilderEbRKNSt3__14mapINS_2spINS_7SurfaceEEENSt3__16vectorIiNS9_9allocatorIiEEEENS9_4lessISA_EENS9_9allocatorINS9_4pairIKSA_SF_EEEEEERKNS0_20CaptureResultExtrasENS0_19ERROR_BUF_STRATEGYEix",
       PCR_VARIANT_ROB },
 
-    { "_ZN7android7camera334returnAndRemovePendingOutputBuffersEbRKNS_2spINS0_20NotificationListenerEEEPK22camera3_stream_buffer_tmllbNS_15SessionStatsBuilderEbRKNSt3__14mapINS_2spINS_7SurfaceEEENSt3__16vectorIiNS9_9allocatorIiEEEENS9_4lessISA_EENS9_9allocatorINS9_4pairIKSA_SF_EEEEEERKNS0_20CaptureResultExtrasENS0_19ERROR_BUF_STRATEGYEi",
-      PCR_VARIANT_ROB },
+    /* Do not add returnAndRemovePendingOutputBuffers here.  That helper has
+     * a different four-argument ABI (it takes an InFlightRequest&), so it
+     * cannot use the returnOutputBuffers proxy even though its name is close.
+     * It is deliberately left out rather than being treated as a fallback. */
     { nullptr, 0 }
 };
 
@@ -145,6 +147,25 @@ static int score_symbol(const char *demangled, ScanKind kind, size_t size,
     if (strstr(demangled, "Callbacks"))       return -9999;
     if (strstr(demangled, "CompositeStream")) return -9999;
 
+    /* Reject all Binder proxies, stubs, and HIDL/AIDL dispatcher interfaces.
+     * Hooking these with member function pointers corrupts IPC registers/stack
+     * and causes fatal SIGSEGV in writeToParcel / onTransact. */
+    if (strstr(demangled, "BnHw") ||
+        strstr(demangled, "BpHw") ||
+        strstr(demangled, "BnCamera") ||
+        strstr(demangled, "BpCamera") ||
+        strstr(demangled, "BnInterface") ||
+        strstr(demangled, "BpInterface") ||
+        strstr(demangled, "_hidl_") ||
+        strstr(demangled, "IInterface") ||
+        strstr(demangled, "HidlInstrumentor") ||
+        strstr(demangled, "CameraDeviceCallback") ||
+        strstr(demangled, "ICameraDeviceCallback") ||
+        strstr(demangled, "ICameraDeviceSession") ||
+        strstr(demangled, "HidlCamera3DeviceCallback") ||
+        strstr(demangled, "AidlCamera3DeviceCallback")) {
+        return -9999;
+    }
 
     if (is_thunk(demangled)) return -9999;
 
@@ -152,6 +173,25 @@ static int score_symbol(const char *demangled, ScanKind kind, size_t size,
 
 
     if (kind == SCAN_ROB) {
+        /* returnOutputBuffers() has two unrelated ABI families on vendor
+         * builds.  The framework helper in android::camera3 is a free
+         * function with the 14-argument ABI used by my_rob_proxy.  OPlus/
+         * MediaTek also expose extension methods with the same basename:
+         *
+         *   CameraServiceExtImpl*::returnOutputBuffers(CaptureOutputStates&,
+         *       camera_stream_buffer*, size_t, InFlightRequest&, nsecs_t, bool)
+         *
+         * Those are member functions with a six-argument ABI.  Treating the
+         * latter as the helper corrupts x0 (the C++ this pointer) when
+         * SHADOWHOOK_CALL_PREV forwards the proxy's first bool, and the next
+         * call into the extension commonly faults at this + 0x88 from
+         * notifyShutter.  Only accept the framework helper here; the extension
+         * is called normally by that helper and must not be inline-hooked with
+         * this proxy. */
+        if (strncmp(demangled, "android::camera3::returnOutputBuffers(",
+                    sizeof("android::camera3::returnOutputBuffers(") - 1) != 0) {
+            return -9999;
+        }
         int score = 50;
         if (size > 200) score += 50;
         else if (size > 16) score += 20;
@@ -185,8 +225,22 @@ static int score_symbol(const char *demangled, ScanKind kind, size_t size,
 }
 
 static int classify_variant(const char *demangled, ScanKind kind) {
+    if (!demangled) return 0;
+    if (strstr(demangled, "BnHw") || strstr(demangled, "BpHw") ||
+        strstr(demangled, "BnCamera") || strstr(demangled, "BpCamera") ||
+        strstr(demangled, "_hidl_") || strstr(demangled, "CameraDeviceCallback") ||
+        strstr(demangled, "ICameraDeviceCallback")) {
+        return PCR_VARIANT_UNKNOWN;
+    }
     if (kind == SCAN_ROB) {
-        return PCR_VARIANT_ROB;
+        /* Keep this in lockstep with score_symbol(): only the free framework
+         * helper has the 14-argument ABI implemented by hook_proxy.cpp.
+         * Vendor extension methods are intentionally not ROB candidates. */
+        if (strncmp(demangled, "android::camera3::returnOutputBuffers(",
+                    sizeof("android::camera3::returnOutputBuffers(") - 1) == 0) {
+            return PCR_VARIANT_ROB;
+        }
+        return PCR_VARIANT_UNKNOWN;
     }
     if (kind == SCAN_PCR) {
         if (strstr(demangled, "returnOutputBuffers("))
@@ -780,13 +834,23 @@ void resolve_camera3_usage_hooks(ResolvedSymbol *setusage, ResolvedSymbol *geten
         } uctx = { setusage, getendpoint };
 
         dl_iterate_phdr([](struct dl_phdr_info *info, size_t , void *data) -> int {
-            if (!info->dlpi_name) return 0;
-            if (!strstr(info->dlpi_name, "libcameraservice.so")) return 0;
+            bool is_target = false;
+            const char *open_path = nullptr;
+            if (info->dlpi_name && strstr(info->dlpi_name, "libcameraservice.so")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (info->dlpi_name && strstr(info->dlpi_name, "cameraserver")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
+                is_target = true;
+                open_path = "/proc/self/exe";
+            }
+            if (!is_target || !open_path) return 0;
 
             UsageCtx *uc = (UsageCtx *)data;
 
-
-            int fd = open(info->dlpi_name, O_RDONLY);
+            int fd = open(open_path, O_RDONLY);
             if (fd < 0) return 0;
             struct stat st;
             if (fstat(fd, &st) < 0) { close(fd); return 0; }
@@ -969,11 +1033,23 @@ int resolve_camera3_returnbuffer(ResolvedSymbol *out, int max_count) {
         rctx.max_count = max_count;
 
         dl_iterate_phdr([](struct dl_phdr_info *info, size_t , void *data) -> int {
-            if (!info->dlpi_name || !strstr(info->dlpi_name, "libcameraservice.so")) return 0;
+            bool is_target = false;
+            const char *open_path = nullptr;
+            if (info->dlpi_name && strstr(info->dlpi_name, "libcameraservice.so")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (info->dlpi_name && strstr(info->dlpi_name, "cameraserver")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
+                is_target = true;
+                open_path = "/proc/self/exe";
+            }
+            if (!is_target || !open_path) return 0;
 
             RtrnCtx *rc = (RtrnCtx *)data;
 
-            int fd = open(info->dlpi_name, O_RDONLY);
+            int fd = open(open_path, O_RDONLY);
             if (fd < 0) return 0;
             struct stat st;
             if (fstat(fd, &st) < 0) { close(fd); return 0; }
@@ -1141,11 +1217,23 @@ int resolve_camera3_returnbufferlocked(ResolvedSymbol *out, int max_count) {
         rctx.max_count = max_count;
 
         dl_iterate_phdr([](struct dl_phdr_info *info, size_t , void *data) -> int {
-            if (!info->dlpi_name || !strstr(info->dlpi_name, "libcameraservice.so")) return 0;
+            bool is_target = false;
+            const char *open_path = nullptr;
+            if (info->dlpi_name && strstr(info->dlpi_name, "libcameraservice.so")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (info->dlpi_name && strstr(info->dlpi_name, "cameraserver")) {
+                is_target = true;
+                open_path = info->dlpi_name;
+            } else if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
+                is_target = true;
+                open_path = "/proc/self/exe";
+            }
+            if (!is_target || !open_path) return 0;
 
             RtrnLockedCtx *rc = (RtrnLockedCtx *)data;
 
-            int fd = open(info->dlpi_name, O_RDONLY);
+            int fd = open(open_path, O_RDONLY);
             if (fd < 0) return 0;
             struct stat st;
             if (fstat(fd, &st) < 0) { close(fd); return 0; }

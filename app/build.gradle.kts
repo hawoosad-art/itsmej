@@ -11,12 +11,14 @@ val localProps = Properties().also { props ->
         ?.inputStream()?.use { props.load(it) }
 }
 
-val ffmpegDir: String? = localProps.getProperty("ffmpeg.dir") ?: System.getenv("FFMPEG_ROOT")
-val opensslDir: String? = localProps.getProperty("openssl.dir") ?: System.getenv("OPENSSL_ROOT")
+val gstreamerDir: String? = localProps.getProperty("gstreamer.dir") ?: System.getenv("GSTREAMER_ROOT")
+val libyuvDir: String? = localProps.getProperty("libyuv.dir") ?: System.getenv("LIBYUV_ROOT")
 
 android {
     namespace  = "com.itsme.amkush"
     compileSdk = 35
+    // Match the LLVM toolchain used by the current GStreamer Android SDK.
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.itsme.amkush"
@@ -35,23 +37,28 @@ android {
         }.getOrNull() ?: "unknown"
         buildConfigField("String", "FG_VERSION", "\"$fgVersion\"")
 
-        ndk {
-            // BUG-7 FIX: removed x86_64.
-            // injectNow() / startWatchdogDaemon() have no x86_64 branch — they
-            // return "Unsupported ABI" immediately on x86_64 devices.  Listing
-            // x86_64 here caused the APK to install on emulators / Intel tablets
-            // where injection then silently failed.  Real Android devices are
-            // arm64 or armeabi-v7a; add x86_64 back only when injector binaries
-            // are built for that ABI.
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-        }
+        // Short commit sha embedded at build time for diagnostics and log metadata.
+        val fgBuild: String = runCatching {
+            val p = ProcessBuilder("git", "rev-parse", "--short=10", "HEAD")
+                .redirectErrorStream(true).start()
+            p.inputStream.bufferedReader().readText().trim().takeIf { it.isNotEmpty() }
+        }.getOrNull() ?: "unknown"
+        buildConfigField("String", "FG_BUILD", "\"$fgBuild\"")
 
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++14", "-frtti", "-fexceptions")
                 val args = mutableListOf<String>()
-                if (!ffmpegDir.isNullOrEmpty()) args += "-DFFMPEG_ROOT=$ffmpegDir"
-                if (!opensslDir.isNullOrEmpty()) args += "-DOPENSSL_ROOT=$opensslDir"
+                if (!gstreamerDir.isNullOrEmpty()) args += "-DGSTREAMER_ROOT=$gstreamerDir"
+                if (!libyuvDir.isNullOrEmpty()) args += "-DLIBYUV_ROOT=$libyuvDir"
+                // Bake the git branch + short SHA into libframe_producer.so so the
+                // FRESH-BUILD-CHECK banner in logcat proves which build is running.
+                val fgBranch = runCatching {
+                    ProcessBuilder("git", "rev-parse", "--abbrev-ref", "HEAD")
+                        .redirectErrorStream(true).start()
+                        .inputStream.bufferedReader().readText().trim()
+                }.getOrNull()?.takeIf { it.isNotEmpty() } ?: "unknown"
+                args += "-DFRAME_BUILD_ID=$fgBranch-$fgBuild"
                 if (args.isNotEmpty()) arguments(*args.toTypedArray())
             }
         }
@@ -61,6 +68,17 @@ android {
         cmake {
             path    = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1+"
+        }
+    }
+
+    // Sideload builds are published per ABI so each device receives only its
+    // matching native libraries. Both currently supported ARM ABIs remain.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
         }
     }
 
@@ -149,13 +167,8 @@ dependencies {
     implementation("com.github.bumptech.glide:glide:4.16.0")
     annotationProcessor("com.github.bumptech.glide:compiler:4.16.0")
 
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
-    implementation("com.google.code.gson:gson:2.11.0")
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
 
-    // FFmpegKit is COMPLETELY REMOVED. We use our custom FFmpegDecoder + LibYuv instead.
+    // GStreamer is built from upstream source by the CI workflow and linked into the native pipeline.
 
     implementation("androidx.camera:camera-core:1.4.2")
     implementation("androidx.camera:camera-camera2:1.4.2")

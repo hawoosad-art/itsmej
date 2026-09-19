@@ -6,8 +6,12 @@
         <domain includeSubdomains="true">hercules-dev.com</domain>
     </domain-config>
 
-    <!-- Default: use system CA certificates -->
-    <base-config cleartextTrafficPermitted="false">
+    <!-- [V89] base-config OVERRIDES the manifest usesCleartextTraffic flag.
+         It was false, so rtsp://192.168.x.x (any LAN IP not listed above)
+         was denied cleartext and the Java-side stream preview could never
+         connect — while the native GStreamer path (injection) was unaffected.
+         This app talks plain rtsp/http to LAN hosts by design: permit. -->
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>

@@ -24,7 +24,7 @@ import com.itsme.amkush.utils.SharedPrefs
 private val BgDark  = Color(0xFF0E0E1C)
 private val Violet  = Color(0xFF6C63FF)
 
-enum class TabScreen { HOME, STREAM, DENYLIST, MEDIA, STATS, SETTINGS }
+enum class TabScreen { HOME, STREAM, DENYLIST, MEDIA, STATS }
 
 data class TabItem(val id: TabScreen, val title: String, val iconRes: Int)
 
@@ -69,7 +69,6 @@ fun DashboardContent(
         TabItem(TabScreen.DENYLIST, "Deny",     R.drawable.ic_shield),
         TabItem(TabScreen.MEDIA,    "Media",    R.drawable.ic_media),
         TabItem(TabScreen.STATS,    "Stats",    R.drawable.ic_stats),
-        TabItem(TabScreen.SETTINGS, "Settings", R.drawable.ic_settings),
     )
 
 
@@ -159,7 +158,6 @@ fun DashboardContent(
                             targetPackage = targetPackage,
                             targetAppName = targetAppName
                         )
-                        TabScreen.SETTINGS -> DeviceSpoofContent()
                     }
                 }
             }

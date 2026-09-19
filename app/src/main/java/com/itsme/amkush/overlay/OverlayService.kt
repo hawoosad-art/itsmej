@@ -23,11 +23,18 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.itsme.amkush.R
 import com.itsme.amkush.hooks.NativeFrameProducer
 import com.itsme.amkush.utils.Logger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Foreground service that draws a floating pan/zoom control overlay on top of
@@ -35,7 +42,8 @@ import com.itsme.amkush.utils.Logger
  *
  * Design: A circular draggable FAB showing the hacker icon. Tapping toggles a
  * pop-out horizontal control panel to the left of the FAB.
- * Slot buttons are shown but greyed out (not yet implemented).
+ * Slot buttons S1/S2/S3 hot-swap the injected media between the pre-loaded
+ * slots (no need to go back to the app to upload/switch media).
  *
  * Drag implementation:
  *   The touch listener is attached to the FAB only (not the whole root), and
@@ -55,7 +63,7 @@ class OverlayService : Service() {
         private const val TAG          = "OverlayService"
         private const val NOTIF_ID     = 2001
         private const val CHANNEL_ID   = "facegate_overlay_channel"
-        private const val CHANNEL_NAME = "FaceGate Overlay Controls"
+        private const val CHANNEL_NAME = "EcomCam Overlay Controls"
 
         const val ACTION_HIDE_OVERLAY  = "com.itsme.amkush.HIDE_OVERLAY"
         const val ACTION_SHOW_OVERLAY  = "com.itsme.amkush.SHOW_OVERLAY"
@@ -141,6 +149,7 @@ class OverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceScope.cancel()
         removeOverlay()
         isRunning = false
         Logger.i(Logger.INJECTION, "$TAG overlay removed")
@@ -161,11 +170,7 @@ class OverlayService : Service() {
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE,
+            overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
@@ -184,6 +189,27 @@ class OverlayService : Service() {
         wm.addView(root, params)
     }
 
+    /* [V90] V88 made the button hide-proof via TYPE_ACCESSIBILITY_OVERLAY +
+     * an accessibility service — but Play Protect HARD-BLOCKS installation of
+     * any APK carrying an accessibility service ("can request access to
+     * sensitive data"), and disabling Play Protect is not an option. Service
+     * removed again; instead we DETECT the OS-level hiding (see
+     * onOverlayWindowVisibility) and surface it via log + notification. */
+    private fun overlayWindowType(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+    /* [V90] fired by the root view when the SYSTEM hides our window —
+     * Android 12+ does this while a foreground app requested
+     * setHideOverlayWindows(true) (banking/security apps). */
+    private fun onOverlayWindowVisibility(v: Int) {
+        if (v != View.VISIBLE && overlayVisible) {
+            Logger.w(TAG, "system hid the overlay — a foreground app requested setHideOverlayWindows; the button returns when you leave that app")
+            updateNotification(false)
+        }
+    }
+
     private fun removeOverlay() {
         try {
             overlayRoot?.let { windowManager?.removeView(it) }
@@ -196,6 +222,9 @@ class OverlayService : Service() {
 
     private var panelView: View? = null
     private var isPanelOpen = false
+    private val slotButtons = mutableListOf<TextView>()
+    private var scaleLabelView: TextView? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // ── Play/stop transport ────────────────────────────────────────────────
     private var playPauseBtn: TextView? = null
@@ -210,7 +239,12 @@ class OverlayService : Service() {
         val ctx = this
 
         // Root: horizontal row — [panel] [FAB]
-        val root = LinearLayout(ctx).apply {
+        val root = object : LinearLayout(ctx) {
+            override fun onWindowVisibilityChanged(visibility: Int) {
+                super.onWindowVisibilityChanged(visibility)
+                onOverlayWindowVisibility(visibility)
+            }
+        }.apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.TRANSPARENT)
@@ -281,6 +315,11 @@ class OverlayService : Service() {
         return frame
     }
 
+    private fun updateScaleLabel() {
+        val scale = OverlayState.scaleQ16 / 65536.0f
+        scaleLabelView?.text = String.format(java.util.Locale.US, "%.1f×", scale)
+    }
+
     private fun buildPanel(): View {
         val ctx = this
 
@@ -321,7 +360,7 @@ class OverlayService : Service() {
         ))
         dpad.addView(dpadRow(
             dpadBtn("◀") { OverlayState.panLeft();  pushOverlay() },
-            dpadBtn("⊙") { OverlayState.reset();    pushRotation(); pushOverlay() },
+            dpadBtn("⊙") { OverlayState.reset();    pushRotation(); pushOverlay(); updateScaleLabel(); refreshSlotButtons() },
             dpadBtn("▶") { OverlayState.panRight(); pushOverlay() }
         ))
         dpad.addView(dpadRow(
@@ -349,7 +388,7 @@ class OverlayService : Service() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        zoomRow.addView(controlBtn("−") { OverlayState.zoomOut(); pushOverlay() })
+        zoomRow.addView(controlBtn("−") { OverlayState.zoomOut(); pushOverlay(); updateScaleLabel() })
         val scaleLabel = TextView(ctx).apply {
             text = "1.0×"
             textSize = 8f
@@ -357,11 +396,13 @@ class OverlayService : Service() {
             gravity = Gravity.CENTER
             minWidth = dp(28)
         }
+        scaleLabelView = scaleLabel
+        updateScaleLabel()
         zoomRow.addView(scaleLabel, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { marginStart = dp(2); marginEnd = dp(2) })
-        zoomRow.addView(controlBtn("+") { OverlayState.zoomIn(); pushOverlay() })
+        zoomRow.addView(controlBtn("+") { OverlayState.zoomIn(); pushOverlay(); updateScaleLabel() })
         rightCol.addView(zoomRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -372,11 +413,14 @@ class OverlayService : Service() {
             gravity = Gravity.CENTER_VERTICAL
         }
         for (i in 0 until MediaSlotState.SLOT_COUNT) {
-            slotRow.addView(disabledSlotBtn("S${i + 1}"), LinearLayout.LayoutParams(
+            val b = slotBtn(i)
+            slotButtons.add(b)
+            slotRow.addView(b, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { if (i > 0) marginStart = dp(3) })
         }
+        refreshSlotButtons()
         rightCol.addView(slotRow)
 
         // ── Play/stop transport button (videos & images) ──────────────────
@@ -415,23 +459,144 @@ class OverlayService : Service() {
             textSize = 15f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            background = roundedBtn(Color.argb(50, 255, 255, 255))
+            val normalBg = roundedBtn(Color.argb(50, 255, 255, 255))
+            val pressedBg = roundedBtn(Color.argb(120, 255, 255, 255))
+            background = normalBg
             setPadding(0, 0, 0, 0)
+            isClickable = true
+            isFocusable = true
+            // Fix: return true on DOWN to claim sequence, otherwise UP never arrives
+            // and click becomes unreliable (zoom buttons especially)
+            /* [V77] press-and-hold auto-repeat. Single taps alone felt dead:
+             * one tap = one 40px step, so users mashed the arrows ("must
+             * press many times"). Now: tap fires once immediately on UP as
+             * before, and HOLDING repeats the action every 120 ms after a
+             * 400 ms delay — smooth continuous pan/zoom. */
+            val repeatHandler = android.os.Handler(android.os.Looper.getMainLooper())
+            var repeatTask: Runnable? = null
+            setOnTouchListener { v, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.background = pressedBg
+                        val task = object : Runnable {
+                            override fun run() {
+                                v.performClick()
+                                repeatHandler.postDelayed(this, 120L)
+                            }
+                        }
+                        repeatTask = task
+                        repeatHandler.postDelayed(task, 400L)
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.background = normalBg
+                        repeatTask?.let { repeatHandler.removeCallbacks(it) }
+                        repeatTask = null
+                        // Only fire if still inside view bounds
+                        val inside = event.x >= 0 && event.x < v.width && event.y >= 0 && event.y < v.height
+                        if (inside) {
+                            v.performClick()
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.background = normalBg
+                        repeatTask?.let { repeatHandler.removeCallbacks(it) }
+                        repeatTask = null
+                        true
+                    }
+                    else -> false
+                }
+            }
             setOnClickListener { onClick() }
         }
 
-    private fun disabledSlotBtn(label: String): View =
+    /** A functional media-slot button: tapping S1/S2/S3 switches the injected
+     *  media to that pre-loaded slot (hot-swap via NativeFrameProducer). */
+    private fun slotBtn(i: Int): TextView =
         TextView(this).apply {
-            text = label
+            text = "S${i + 1}"
             textSize = 10f
-            setTextColor(Color.argb(80, 255, 255, 255))
             gravity = Gravity.CENTER
-            background = roundedBtn(Color.argb(20, 255, 255, 255))
-            isEnabled = false
-            isClickable = false
             width = dp(28); height = dp(28)
             setPadding(0, 0, 0, 0)
+            isClickable = true
+            isFocusable = true
+            val normalColor = Color.argb(20, 255, 255, 255)
+            val pressedColor = Color.argb(120, 255, 255, 255)
+            setOnTouchListener { v, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.background = roundedBtn(pressedColor)
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        refreshSlotButtons()
+                        val inside = event.x >= 0 && event.x < v.width && event.y >= 0 && event.y < v.height
+                        if (inside) v.performClick()
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        refreshSlotButtons()
+                        true
+                    }
+                    else -> false
+                }
+            }
+            setOnClickListener {
+                val slot = MediaSlotState.getSlot(i)
+                val uri = slot.uri
+                if (uri == null) {
+                    Toast.makeText(
+                        this@OverlayService,
+                        "S${i + 1} is empty — upload media to it first",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@setOnClickListener
+                }
+                OverlayState.setActiveSlot(i)
+                refreshSlotButtons()
+
+                serviceScope.launch {
+                    val ok = withContext(Dispatchers.IO) {
+                        NativeFrameProducer.startWithUri(this@OverlayService, uri)
+                    }
+                    if (ok) {
+                        OverlayState.resetTransform()
+                        pushRotation()
+                        pushOverlay()
+                        updateScaleLabel()
+                        refreshSlotButtons()
+                        Toast.makeText(this@OverlayService, "Switched to S${i + 1}", Toast.LENGTH_SHORT).show()
+                        Logger.i(Logger.INJECTION, "$TAG slot switched to S${i + 1} (${slot.label})")
+                    } else {
+                        Toast.makeText(this@OverlayService, "Failed to switch to S${i + 1}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
         }
+
+    /** Re-paint the slot buttons: active slot highlighted, filled slots tinted. */
+    private fun refreshSlotButtons() {
+        slotButtons.forEachIndexed { i, tv ->
+            val active = OverlayState.activeSlot == i
+            val filled = MediaSlotState.getSlot(i).uri != null
+            tv.background = roundedBtn(
+                when {
+                    active -> Color.argb(255, 108, 99, 255)   // violet
+                    filled -> Color.argb(70, 74, 222, 128)    // green tint
+                    else   -> Color.argb(20, 255, 255, 255)
+                }
+            )
+            tv.setTextColor(
+                when {
+                    active -> Color.WHITE
+                    filled -> Color.argb(220, 255, 255, 255)
+                    else   -> Color.argb(80, 255, 255, 255)
+                }
+            )
+        }
+    }
 
     private fun roundedBtn(color: Int): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
@@ -551,7 +716,7 @@ class OverlayService : Service() {
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 setShowBadge(false)
-                description = "Controls for the FaceGate floating pan/zoom overlay"
+                description = "Controls for the EcomCam floating pan/zoom overlay"
             }
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
         }
@@ -570,7 +735,7 @@ class OverlayService : Service() {
         )
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("FaceGate Overlay")
+            .setContentTitle("EcomCam Overlay")
             .setContentText(
                 if (visible) "Pan/zoom controls active — tap Hide to allow camera permissions"
                 else "Overlay hidden — tap Show to restore controls"

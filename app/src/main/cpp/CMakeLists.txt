@@ -1,120 +1,191 @@
 cmake_minimum_required(VERSION 3.22.1)
-  project("facegate" CXX)
+project("facegate" LANGUAGES C CXX)
 
-  # ── FFmpeg prebuilt root directory ────────────────────────────────────────────
-  if(NOT DEFINED FFMPEG_ROOT)
-      if(DEFINED ENV{FFMPEG_ROOT})
-          set(FFMPEG_ROOT $ENV{FFMPEG_ROOT})
-      else()
-          set(FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/../ffmpeg")
-          message(WARNING "FFMPEG_ROOT not set — defaulting to ${FFMPEG_ROOT}")
-      endif()
-  endif()
+# GStreamer Android SDK built by the CI workflow with Cerbero.
+if(NOT DEFINED GSTREAMER_ROOT)
+    if(DEFINED ENV{GSTREAMER_ROOT})
+        set(GSTREAMER_ROOT "$ENV{GSTREAMER_ROOT}")
+    else()
+        message(FATAL_ERROR "GSTREAMER_ROOT is not set. Configure gstreamer.dir in local.properties.")
+    endif()
+endif()
+if(NOT EXISTS "${GSTREAMER_ROOT}")
+    message(FATAL_ERROR "GStreamer SDK not found at: ${GSTREAMER_ROOT}")
+endif()
+# CI stores one SDK per Android ABI below the artifact root.
+if(EXISTS "${GSTREAMER_ROOT}/${ANDROID_ABI}/share/cmake")
+    set(GSTREAMER_ROOT "${GSTREAMER_ROOT}/${ANDROID_ABI}")
+endif()
+if(NOT EXISTS "${GSTREAMER_ROOT}/share/cmake")
+    message(FATAL_ERROR "GStreamer SDK for ${ANDROID_ABI} not found below ${GSTREAMER_ROOT}")
+endif()
 
-  set(FFMPEG_ABI_DIR "${FFMPEG_ROOT}/${ANDROID_ABI}")
+list(APPEND CMAKE_MODULE_PATH "${GSTREAMER_ROOT}/share/cmake")
+set(GStreamer_ROOT_DIR "${GSTREAMER_ROOT}")
+set(GStreamer_USE_STATIC_LIBS ON)
+set(GSTREAMER_NDK_BUILD_PATH "${GSTREAMER_ROOT}/share/gst-android/ndk-build")
 
-  if(NOT EXISTS "${FFMPEG_ABI_DIR}/lib")
-      message(FATAL_ERROR
-          "FFmpeg libraries not found at: ${FFMPEG_ABI_DIR}/lib\n"
-          "Download prebuilts from the ffmpeg-builder workflow or set "
-          "ffmpeg.dir in local.properties.")
-  endif()
+# GStreamer is statically registered into a mobile bridge library. These
+# categories provide uridecodebin, RTSP/RTP, local containers, Android
+# MediaCodec decoding, videoconvert/videoscale, and app/audio/video APIs.
+include("${GSTREAMER_NDK_BUILD_PATH}/plugins.cmake")
+# [V73] RTSP + RTMP only. Owner directive: drop every other streaming
+# protocol. The Cerbero groups previously linked the whole _NET set
+# (dtls, netsim, rist, rtmp2, rtpmanagerbad, rtponvif, sctp, sdpelem,
+# srtp, srt, webrtc, soup/http) plus the streaming demuxers that hide in
+# _CODECS (hls, dash, smoothstreaming, rfbsrc) — none usable by the
+# producer. Explicit minimal net list: rtspsrc needs rtp (depayloaders),
+# rtpmanager (jitterbuffer) and udp (RTP transport); tcp kept for
+# interleaved; rtmp = the librtmp-based plugin for rtmp:// sources.
+# CODECS keeps videoparsersbad (h264parse) and androidmedia (MediaCodec);
+# only the streaming demuxers are trimmed from it.
+# [V77] NET is back to the FULL Cerbero group. The V73 explicit minimal
+# list (rtsp rtp rtpmanager udp tcp rtmp) shipped on the Tab A8 as: RTSP
+# negotiated caps + delivered exactly ONE frame per generation, then the
+# freeze watchdog looped forever (14.unisoc.1 log) — something in the
+# dropped net plugins (dtls/srtp/rtprtx*/sdpelem/...) is part of the
+# rtspsrc receive path after all. Correctness beats a few MB: only the
+# streaming DEMUXERS stay removed, which is what "no hls etc." means.
+set(GSTREAMER_PLUGINS_CODECS_TRIMMED ${GSTREAMER_PLUGINS_CODECS})
+list(REMOVE_ITEM GSTREAMER_PLUGINS_CODECS_TRIMMED
+     hls dash smoothstreaming rfbsrc)
+set(GSTREAMER_PLUGINS
+    ${GSTREAMER_PLUGINS_CORE}
+    ${GSTREAMER_PLUGINS_PLAYBACK}
+    ${GSTREAMER_PLUGINS_CODECS_TRIMMED}
+    ${GSTREAMER_PLUGINS_CODECS_RESTRICTED}
+    ${GSTREAMER_PLUGINS_CODECS_GPL}
+    ${GSTREAMER_PLUGINS_NET}
+)
+set(GStreamer_EXTRA_DEPS
+    gstreamer-app-1.0
+    gstreamer-audio-1.0
+    gstreamer-video-1.0
+    gstreamer-pbutils-1.0
+    gstreamer-rtp-1.0
+    gstreamer-rtsp-1.0
+    gstreamer-sdp-1.0
+    glib-2.0
+)
+set(G_IO_MODULES openssl)
+# Use the module's uppercase inputs so its Gradle-specific path handling
+# does not reinterpret these already-absolute destinations.
+set(GSTREAMER_JAVA_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/../java")
+set(GSTREAMER_ASSETS_DIR "${CMAKE_CURRENT_LIST_DIR}/../assets")
+# [V83 stealth-fix] V82 tried set_target_properties(OUTPUT_NAME) AFTER
+# find_package — silently ignored because the module itself sets
+# LIBRARY_OUTPUT_NAME (which wins over OUTPUT_NAME). The module's documented
+# knob is GStreamer_Mobile_MODULE_NAME, honoured only when defined BEFORE
+# find_package (its own defaulting is `if(NOT DEFINED ...)`). Result:
+# libgstreamer_android.so → libamkush.so, and consumers' DT_NEEDED picks the
+# new name up automatically because they link the CMake target.
+set(GStreamer_Mobile_MODULE_NAME "amkush")
+find_package(GStreamerMobile COMPONENTS
+    ${GSTREAMER_PLUGINS}
+    ca_certificates
+    REQUIRED
+)
 
-  # ── OpenSSL prebuilt root directory ───────────────────────────────────────────
-  if(NOT DEFINED OPENSSL_ROOT)
-      if(DEFINED ENV{OPENSSL_ROOT})
-          set(OPENSSL_ROOT $ENV{OPENSSL_ROOT})
-      else()
-          set(OPENSSL_ROOT "${CMAKE_SOURCE_DIR}/../openssl-android")
-          message(WARNING "OPENSSL_ROOT not set — defaulting to ${OPENSSL_ROOT}")
-      endif()
-  endif()
+# The generated Android bridge source includes GLib headers directly. The
+# GStreamerMobile module exposes GStreamer include paths to consumers, but
+# does not apply GLib's generated include path to its own source target.
+target_include_directories(GStreamerMobile PRIVATE
+    "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include"
+)
 
-  set(OPENSSL_ABI_DIR "${OPENSSL_ROOT}/${ANDROID_ABI}")
+# Cerbero installs the plugin archives but does not generate one pkg-config
+# module per plugin. The current FindGStreamerMobile module consumes those
+# modules to create its plugin targets, so the CI staging step supplies the
+# small metadata files. Keep every built static archive in the mobile bridge's
+# link group as well: plugin-specific dependencies (RTMP, SRT, image codecs,
+# OpenSSL, and their transitive libraries) are not all in gstreamer-1.0.pc.
+file(GLOB GSTREAMER_PREFIX_STATIC_LIBS CONFIGURE_DEPENDS
+    "${GSTREAMER_ROOT}/lib/*.a"
+    "${GSTREAMER_ROOT}/lib/gstreamer-1.0/*.a"
+    "${GSTREAMER_ROOT}/lib/gio/modules/*.a"
+)
+if(GSTREAMER_PREFIX_STATIC_LIBS)
+    target_link_libraries(GStreamerMobile PRIVATE
+        "-Wl,--start-group"
+        ${GSTREAMER_PREFIX_STATIC_LIBS}
+        "-Wl,--end-group"
+    )
+endif()
 
-  # ── FFmpeg prebuilt static libs ───────────────────────────────────────────────
-  foreach(_lib avformat avcodec avutil swresample swscale)
-      add_library(${_lib} STATIC IMPORTED)
-      set_target_properties(${_lib} PROPERTIES
-          IMPORTED_LOCATION "${FFMPEG_ABI_DIR}/lib/lib${_lib}.a"
-      )
-  endforeach()
+# libyuv is retained for the camera-surface conversion boundary. No legacy
+# media scaling libraries are linked.
+if(NOT DEFINED LIBYUV_ROOT)
+    if(DEFINED ENV{LIBYUV_ROOT})
+        set(LIBYUV_ROOT "$ENV{LIBYUV_ROOT}")
+    else()
+        message(FATAL_ERROR "LIBYUV_ROOT is not set.")
+    endif()
+endif()
+add_library(yuv STATIC IMPORTED)
+set_target_properties(yuv PROPERTIES
+    IMPORTED_LOCATION "${LIBYUV_ROOT}/${ANDROID_ABI}/libyuv.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${LIBYUV_ROOT}/include"
+)
 
-  # ── OpenSSL prebuilt static libs ──────────────────────────────────────────────
-  add_library(ssl STATIC IMPORTED)
-  set_target_properties(ssl PROPERTIES
-      IMPORTED_LOCATION "${OPENSSL_ABI_DIR}/lib/libssl.a"
-  )
+find_library(log-lib log REQUIRED)
+find_library(android-lib android REQUIRED)
+find_library(z-lib z REQUIRED)
+find_library(egl-lib EGL REQUIRED)
+find_library(glesv2-lib GLESv2 REQUIRED)
 
-  add_library(crypto STATIC IMPORTED)
-  set_target_properties(crypto PROPERTIES
-      IMPORTED_LOCATION "${OPENSSL_ABI_DIR}/lib/libcrypto.a"
-  )
+# GStreamerMobile statically includes the GL backend from the full Cerbero
+# prefix, so its Android system EGL/GLES dependencies must be explicit.
+target_link_libraries(GStreamerMobile PRIVATE
+    ${android-lib} ${egl-lib} ${glesv2-lib}
+)
 
-  # ── System libraries ──────────────────────────────────────────────────────────
-  find_library(log-lib     log)
-  find_library(android-lib android)
-  find_library(z-lib       z)
+# GStreamer decoder used by InjectionService and stream preview.
+add_library(amkush_decoder SHARED amkush_decoder.cpp)
+target_compile_options(amkush_decoder PRIVATE
+    -O3 -fPIC -ffast-math -frtti -fexceptions -DNDEBUG
+)
+target_link_libraries(amkush_decoder
+    GStreamer::mobile
+    ${log-lib} ${android-lib} ${z-lib}
+)
+target_compile_features(amkush_decoder PRIVATE cxx_std_14)
 
-  # ── ffmpeg_decoder.so ─────────────────────────────────────────────────────────
-  add_library(ffmpeg_decoder SHARED ffmpeg_decoder.cpp)
+# I420/NV12/RGBA conversion at the Java/camera boundary.
+add_library(libyuv_wrapper SHARED libyuv_wrapper.cpp)
+target_compile_options(libyuv_wrapper PRIVATE
+    -O3 -fPIC -ffast-math -frtti -fexceptions -DNDEBUG
+)
+target_link_libraries(libyuv_wrapper
+    yuv ${log-lib} ${android-lib}
+)
+target_compile_features(libyuv_wrapper PRIVATE cxx_std_14)
 
-  target_include_directories(ffmpeg_decoder PRIVATE
-      "${FFMPEG_ABI_DIR}/include"
-  )
+# Native producer: GStreamer runs in the application process and feeds the
+# existing ashmem ring/socket contract consumed by the camera hook.
+add_library(frame_producer SHARED
+    amkush_frame_producer.cpp
+    activation.cpp
+)
+target_compile_options(frame_producer PRIVATE
+    -O2 -fPIC -fno-sanitize=cfi -DNDEBUG
+)
 
-  target_compile_options(ffmpeg_decoder PRIVATE
-      -O3 -fPIC -ffast-math -frtti -fexceptions -DNDEBUG
-  )
-
-  target_link_libraries(ffmpeg_decoder
-      avformat avcodec avutil swresample swscale
-      ssl crypto
-      mediandk ${z-lib} ${log-lib} ${android-lib}
-  )
-
-  target_compile_features(ffmpeg_decoder PRIVATE cxx_std_14)
-
-  # ── libyuv_wrapper.so ─────────────────────────────────────────────────────────
-  add_library(libyuv_wrapper SHARED swscale_wrapper.cpp)
-
-  target_include_directories(libyuv_wrapper PRIVATE
-      "${FFMPEG_ABI_DIR}/include"
-  )
-
-  target_compile_options(libyuv_wrapper PRIVATE
-      -O3 -fPIC -ffast-math -frtti -fexceptions -DNDEBUG
-  )
-
-  target_link_libraries(libyuv_wrapper
-      swscale avutil ${log-lib} ${android-lib}
-  )
-
-  target_compile_features(libyuv_wrapper PRIVATE cxx_std_14)
-
-  # ── frame_producer.so ─────────────────────────────────────────────────────────
-  # Includes activation.cpp: native license enforcement + JNI HTTP + anti-tamper.
-  # Includes license/license_client.cpp: HMAC-verified license client (APK side).
-  # URLs are XOR-obfuscated; no plaintext server address in the binary.
-  add_library(frame_producer SHARED
-      frame_producer.cpp
-      activation.cpp
-      license/license_client.cpp
-  )
-
-  target_include_directories(frame_producer PRIVATE
-      "${FFMPEG_ABI_DIR}/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/license"
-  )
-
-  target_compile_options(frame_producer PRIVATE
-      -O2 -fPIC -fno-sanitize=cfi -DNDEBUG
-  )
-
-  target_link_libraries(frame_producer
-      avformat avcodec avutil swresample swscale
-      ssl crypto
-      mediandk ${z-lib} ${log-lib} ${android-lib}
-  )
-
-  target_compile_features(frame_producer PRIVATE cxx_std_17)
+# FRAME_BUILD_ID — git branch + commit SHA injected by the CI workflow so the
+# producer logs prove which build is actually running. Falls back to the
+# HOOK_PROXY_VERSION-style tag if provided, else "dev-unknown".
+if(DEFINED FRAME_BUILD_ID AND NOT FRAME_BUILD_ID STREQUAL "")
+    target_compile_definitions(frame_producer PRIVATE
+        FRAME_BUILD_ID="${FRAME_BUILD_ID}")
+elseif(DEFINED HOOK_PROXY_VERSION AND NOT HOOK_PROXY_VERSION STREQUAL "")
+    target_compile_definitions(frame_producer PRIVATE
+        FRAME_BUILD_ID="${HOOK_PROXY_VERSION}")
+else()
+    target_compile_definitions(frame_producer PRIVATE
+        FRAME_BUILD_ID="dev-unknown")
+endif()
+target_link_libraries(frame_producer
+    GStreamer::mobile
+    ${log-lib} ${android-lib} ${z-lib}
+)
+target_compile_features(frame_producer PRIVATE cxx_std_17)

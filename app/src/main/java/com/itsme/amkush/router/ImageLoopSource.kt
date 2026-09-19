@@ -6,7 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
-import com.itsme.amkush.ffmpeg.FFmpegDecoder
+import com.itsme.amkush.media.AmkushDecoder
 import com.itsme.amkush.utils.Logger
 import java.nio.ByteBuffer
 
@@ -14,7 +14,7 @@ class ImageLoopSource(
     private val context: Context,
     private val uri: Uri,
     private val fps: Int,
-    private val callback: FFmpegDecoder.FrameCallback
+    private val callback: AmkushDecoder.FrameCallback
 ) {
     companion object {
         private const val TAG = "ImageLoopSource"

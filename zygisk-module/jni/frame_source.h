@@ -23,7 +23,21 @@ typedef struct {
     _Atomic uint32_t scale_q16;       /* Q16 fixed-point: 65536 = 1.0 */
     _Atomic uint32_t source_rotation; /* CW degrees from media metadata (0/90/180/270) */
     _Atomic uint32_t manual_rotation; /* User-controlled extra CW degrees (0/90/180/270) */
-    uint8_t          _pad[16];
+    /* [gstreamer.4] Chroma A/B override for the opaque 0x22 (IMPLEMENTATION_DEFINED)
+     * stream. Written by the app via NativeFrameProducer.setChromaOverride() and read
+     * lock-free by cameraserver's injector. -1 = unset (use build default), 0 = NV12,
+     * 1 = NV21. Reads -1 by default so the build-time -DUNISOC_22_CHROMA still applies. */
+    _Atomic int32_t  chroma_override;
+    /* [V26] incremented by the producer on every ring write. The injector keys
+     * its converted-frame cache on this so repeated injections of the same
+     * source frame are memcpys, not full libyuv rotate+scale chains. */
+    _Atomic uint32_t frame_seq;
+    /* [V27] CLOCK_BOOTTIME ms (mod 2^32) refreshed ~2x/s while the producer is
+     * alive. The hook stops injecting (real camera passes through) when this
+     * goes stale — i.e. the app was closed and there is no media/RTSP left to
+     * pull frames from. Wrap-safe: compare as unsigned difference. */
+    _Atomic uint32_t heartbeat_ms32;
+    uint8_t          _pad[4];
 } FrameSourceHeader;
 
 #ifdef __cplusplus
@@ -76,6 +90,14 @@ bool frame_source_get_overlay_params(int32_t *out_pan_x,
                                      int32_t *out_pan_y,
                                      uint32_t *out_scale_q16);
 
+/* [V26] Current producer frame sequence (0 until the first ring write). */
+uint32_t frame_source_get_seq(void);
+
+/* [V27] True while the producer process is alive (heartbeat fresh < 2500 ms).
+ * False after the app is closed/killed, or before the producer ever started.
+ * Injection must be skipped when this is false so the REAL camera shows. */
+bool frame_source_live(void);
+
 /* Return auto-detected source rotation (CW degrees: 0/90/180/270) from media metadata.
  * Returns 0 when not initialized or source has no rotation metadata. */
 uint32_t frame_source_get_rotation(void);
@@ -87,6 +109,15 @@ uint32_t frame_source_get_manual_rotation(void);
 /* Return the combined (source + manual) rotation that inject_yuv should apply.
  * This is the single canonical rotation value — always use this in inject_yuv. */
 uint32_t frame_source_get_total_rotation(void);
+
+/* [gstreamer.4] Chroma A/B override for the opaque 0x22 stream, read from the shared
+ * header. Returns -1 (unset -> use build default), 0 (NV12), or 1 (NV21). Returns -1
+ * when not initialized. */
+int32_t frame_source_get_chroma_override(void);
+
+/* Write the chroma A/B override into the shared header (used by the app-side
+ * NativeFrameProducer.setChromaOverride()). Values: -1 unset, 0 NV12, 1 NV21. */
+void frame_source_set_chroma_override(int32_t override_is_nv21);
 
 #ifdef __cplusplus
 }

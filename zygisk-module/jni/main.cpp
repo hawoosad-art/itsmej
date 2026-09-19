@@ -34,7 +34,7 @@ static atomic_int g_init_started = 0;
 static void do_camera_hook_init(const char *via) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_init_started, &expected, 1)) {
-        LOGI("hooks already initializing (via=%s) — skipping duplicate load", via);
+        LOGI("hooks already initializing (via=%s) version=%s — skipping duplicate load (REBOOT needed for new build)", via, HOOK_PROXY_VERSION);
         return;
     }
 
@@ -165,9 +165,9 @@ static void *init_thread_main(void *) {
 __attribute__((constructor))
 static void on_library_load(void) {
     LOGI("════════════════════════════════════════");
-    LOGI("libhookProxy.so loaded  pid=%d  version=%s", (int)getpid(), HOOK_PROXY_VERSION);
+    LOGI("libhookProxy.so loaded  pid=%d  version=%s [V5-UNISOC-DELAY-ARTIFACT]", (int)getpid(), HOOK_PROXY_VERSION);
     LOGI("  if you see an OLD version here, the stale .so was loaded — "
-         "not the fresh build (version=%s)", HOOK_PROXY_VERSION);
+         "not the fresh build (version=%s [V5] ) — REBOOT device to load new Zygisk module", HOOK_PROXY_VERSION);
     LOGI("════════════════════════════════════════");
 
     if (!is_cameraserver_process()) {

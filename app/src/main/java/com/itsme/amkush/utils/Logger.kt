@@ -25,7 +25,7 @@ package com.itsme.amkush.utils
       const val MAIN      = "MAIN"
       const val APP       = "APP"
 
-      private const val LEGACY_TAG = "FaceGate"
+      private const val LEGACY_TAG = "EcomCam"
       private const val MAX_HOOK_FILE_BYTES = 10L * 1024 * 1024
 
       @Volatile private var isXposedMode = false

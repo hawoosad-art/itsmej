@@ -11,9 +11,11 @@
 #include <shadowhook.h>
 #include <android/log.h>
 #include <atomic>
+#include <thread>
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -72,6 +74,11 @@ static std::atomic<uint32_t> g_getendpointusage_fires{0};
 #define MAX_RTRN_VARIANTS 4
 static void *g_rtrn_stubs[MAX_RTRN_VARIANTS];
 static int   g_rtrn_stub_count = 0;
+/* [V13] When ROB hooks are also active, returnBuffer hooks must only inject
+ * SNAPSHOT (BLOB) buffers — everything else would be double-injected. JPEG
+ * captures never traverse the hooked returnOutputBuffers on UNISOC/MTK (no
+ * inject_jpeg lines ever logged), so this is the photo-capture fix. */
+static bool  g_rtrn_snapshot_only = false;
 static std::atomic<uint32_t> g_rtrn_fire_count[MAX_RTRN_VARIANTS];
 static std::atomic<uint32_t> g_rtrn_inject_attempt[MAX_RTRN_VARIANTS];
 
@@ -197,6 +204,36 @@ typedef struct camera_metadata_entry_t {
     } data;
 } camera_metadata_entry_t;
 
+/* [V54 zoom] Capture ANDROID_SCALER_CROP_REGION + ACTIVE_ARRAY_SIZE from every
+ * capture result (UNTHROTTLED — two tag lookups, negligible cost) and feed
+ * frame_inject so JPEG encodes match the app's zoom. Tag constants from
+ * camera_metadata_tags.h: SCALER_CROP_REGION = 0x000d0000 (SCALER section 13,
+ * first tag), SENSOR_INFO_ACTIVE_ARRAY_SIZE = 0x000f0000 (SENSOR_INFO 15).
+ * TYPE_INT32 == 1. Failure = silent no-op (photos stay full-frame, as today). */
+typedef int (*meta_find_entry_fn)(const camera_metadata_t*, uint32_t, camera_metadata_entry_t*);
+static meta_find_entry_fn f_find_entry = nullptr;
+static bool g_find_entry_tried = false;
+
+static void capture_zoom_crop(const camera3_capture_result_t *result) {
+    if (!result || !result->result) return;
+    if (!g_find_entry_tried) {
+        g_find_entry_tried = true;
+        void *h = dlopen("libcamera_metadata.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen("libcameraservice.so", RTLD_NOW | RTLD_NOLOAD);
+        if (h) f_find_entry = (meta_find_entry_fn)dlsym(h, "find_camera_metadata_entry");
+        LOGI("[V54 zoom] find_camera_metadata_entry resolved: %p", (void*)f_find_entry);
+    }
+    if (!f_find_entry) return;
+    camera_metadata_entry_t crop, act;
+    memset(&crop, 0, sizeof(crop));
+    memset(&act, 0, sizeof(act));
+    if (f_find_entry(result->result, 0x000d0000u, &crop) != 0) return;
+    if (f_find_entry(result->result, 0x000f0000u, &act)  != 0) return;
+    if (crop.type != 1 || crop.count < 4 || !crop.data.i32) return;
+    if (act.type  != 1 || act.count  < 4 || !act.data.i32)  return;
+    frame_inject_set_crop(crop.data.i32, act.data.i32);
+}
+
 static void log_original_metadata(const camera3_capture_result_t *result, int hook_idx,
                                   uint32_t frame_number) {
     if (!result || !result->result) {
@@ -317,6 +354,77 @@ static void my_pcr_meta_observer_proxy(void *states, const void *raw_result) {
 }
 
 
+/* [V18 photo fix] processCaptureResult carries the HAL-filled JPEG BLOB
+ * buffer on ROMs where returnBuffer/returnBufferLocked symbols are absent
+ * and ROB never sees BLOB (UNISOC A13 + MTK A14, 13.unisoc.5/14.mediatek.4:
+ * inject_jpeg ENTRY count 0). Old PCR injection was disabled after a
+ * SEGV_ACCERR — that crash came from mapping the HIDL-wrapper handle via
+ * AHB; V17's dmabuf mmap fallback removes that hazard, so injection is
+ * re-enabled here, in a detached thread (never block the HAL callback
+ * thread) after waiting the buffer's acquire fence. */
+static std::atomic<uint32_t> g_pcr_last_snapshot_frame{0};
+
+static void pcr_snapshot_inject(const camera3_capture_result_t *result, int hook_idx) {
+    if (!g_enabled.load(std::memory_order_relaxed) || !frame_source_initialized() || !frame_source_live()) return; /* [V27] stale source -> real camera */
+    uint32_t frm = result->frame_number;
+    uint32_t last = g_pcr_last_snapshot_frame.load(std::memory_order_relaxed);
+    if (frm && frm == last) return;  // another PCR variant already handled it
+    for (uint32_t i = 0; i < result->num_output_buffers; i++) {
+        const camera3_stream_buffer_t *b = &result->output_buffers[i];
+        if (!b || !b->buffer || !*b->buffer || !b->stream) continue;
+        StreamRole role = stream_map_get_role(b->stream);
+        if (role != STREAM_ROLE_SNAPSHOT) continue;
+        if (b->status != CAMERA3_BUFFER_STATUS_OK) continue;
+        if (frm) g_pcr_last_snapshot_frame.store(frm, std::memory_order_relaxed);
+
+        uintptr_t nh_raw = (uintptr_t)(*b->buffer);
+        if (nh_raw >> 56) nh_raw &= 0x00FFFFFFFFFFFFFFULL;
+        const native_handle_t *nh = (const native_handle_t *)nh_raw;
+        int fd = (nh && nh->numFds > 0) ? nh->data[0] : -1;
+        if (fd < 0) {
+            LOGW("PCR[%d] snapshot frm#%u: no dmabuf fd in handle (numFds=%d)",
+                 hook_idx, frm, nh ? nh->numFds : -1);
+            continue;
+        }
+        int dfd = dup(fd);
+        if (dfd < 0) continue;
+        int fence = (b->acquire_fence >= 0) ? dup(b->acquire_fence) : -1;
+        camera3_stream_t *stream = b->stream;
+        g_pcr_inject_attempt[hook_idx >= 0 ? hook_idx : 0].fetch_add(1);
+        std::thread([dfd, fence, stream, frm, hook_idx]() {
+            if (fence >= 0) {
+                struct pollfd pfd = {};
+                pfd.fd = fence; pfd.events = POLLIN;
+                int pr = poll(&pfd, 1, 2000);
+                if (pr <= 0)
+                    LOGW("PCR[%d] frm#%u: acquire fence wait ret=%d (proceeding)",
+                         hook_idx, frm, pr);
+                close(fence);
+            }
+            FrameData src;
+            if (frame_source_get_latest(&src)) {
+                camera3_stream_buffer_t sb = {};
+                sb.stream = stream;
+                sb.status = CAMERA3_BUFFER_STATUS_OK;
+                sb.acquire_fence = -1;
+                sb.release_fence = -1;
+                int32_t rel = -1;
+                bool ok = inject_jpeg(nullptr, &sb, &src, -1, &rel, dfd);
+                if (ok) {
+                    uint32_t total_ok = g_inject_ok.fetch_add(1) + 1;
+                    LOGI("PCR[%d] ✓ JPEG inject OK frm#%u %ux%u total=%u",
+                         hook_idx, frm, stream->width, stream->height, total_ok);
+                } else {
+                    LOGW("PCR[%d] ✗ JPEG inject FAILED frm#%u", hook_idx, frm);
+                }
+                if (rel >= 0) close(rel);
+            }
+            close(dfd);
+        }).detach();
+        break;  // one snapshot buffer per result
+    }
+}
+
 static void pcr_inject_frames(const camera3_capture_result_t *result, int hook_idx) {
     if (!result) return;
 
@@ -327,6 +435,10 @@ static void pcr_inject_frames(const camera3_capture_result_t *result, int hook_i
 
     if ((total % DIAG_EVERY_N_CALLS) == (DIAG_EVERY_N_CALLS - 1)) {
         dump_diagnostics();
+    }
+
+    if (result->output_buffers && result->num_output_buffers > 0) {
+        pcr_snapshot_inject(result, hook_idx);
     }
 
 
@@ -415,6 +527,9 @@ static void pcr_inject_frames(const camera3_capture_result_t *result, int hook_i
         return;
     }
 
+    /* [V54 zoom] track the app's zoom on EVERY result (unthrottled) */
+    capture_zoom_crop(result);
+
     /* Log the ORIGINAL per-frame metadata (no forging) so we can inspect what
      * the real camera reports. Throttled to avoid spamming the log. */
     {
@@ -430,10 +545,10 @@ static void pcr_inject_frames(const camera3_capture_result_t *result, int hook_i
      * camera's capture rate, causing 98%+ of frames to be skipped entirely.
      * frame_source_get_latest() returns the most recently written frame
      * without consuming it, giving "hold last frame" semantics. */
-    if (!frame_source_initialized()) {
+    if (!frame_source_initialized() || !frame_source_live()) { /* [V27] */
         uint32_t cnt = g_skip_no_source.fetch_add(1);
         if (cnt == 0 || (cnt % 100) == 99) {
-            LOGW("PCR[hook%d] frm#%u — IPC not connected (skip_no_source=%u)",
+            LOGW("PCR[hook%d] frm#%u — IPC not connected or source stale (skip_no_source=%u)",
                  hook_idx, result->frame_number, cnt + 1);
         }
         return;
@@ -556,10 +671,10 @@ static void rob_inject_frames(const camera3_stream_buffer_t *outputBuffers,
      * skip_no_source=196/200 seen in logs.  get_latest() returns the most
      * recently written slot WITHOUT consuming it, injecting the same frame
      * at camera rate when no newer frame is available yet ("hold last frame"). */
-    if (!frame_source_initialized()) {
+    if (!frame_source_initialized() || !frame_source_live()) { /* [V27] app closed -> stop holding last frame */
         uint32_t cnt = g_skip_no_source.fetch_add(1);
         if (cnt == 0 || (cnt % 100) == 99) {
-            LOGW("ROB[%d] fires=%u — IPC not connected (skip_no_source=%u)",
+            LOGW("ROB[%d] fires=%u — IPC not connected or source stale (skip_no_source=%u)",
                  rob_idx, g_rob_fire_count[rob_idx].load(), cnt + 1);
         }
         return;
@@ -858,9 +973,10 @@ static int32_t my_rtrn_proxy_##IDX(                                             
     if (buf && buf->buffer && *buf->buffer &&                                                \
         buf->status == CAMERA3_BUFFER_STATUS_OK &&                                           \
         g_enabled.load(std::memory_order_relaxed) &&                                        \
-        frame_source_initialized()) {                                                        \
+        frame_source_initialized() && frame_source_live()) { /* [V27] */                                                        \
         StreamRole role = stream_map_get_role(buf->stream);                                  \
-        if (stream_map_should_inject(role, buf->status)) {                                   \
+        if (stream_map_should_inject(role, buf->status) &&                            \
+        (!g_rtrn_snapshot_only || role == STREAM_ROLE_SNAPSHOT)) {                  \
             FrameData src;                                                                   \
             if (frame_source_get_latest(&src)) {                                             \
                 g_rtrn_inject_attempt[IDX].fetch_add(1);                                    \
@@ -940,9 +1056,10 @@ static int32_t my_rtrn_locked_proxy_##IDX(                                      
     if (buf && buf->buffer && *buf->buffer &&                                                  \
         buf->status == CAMERA3_BUFFER_STATUS_OK &&                                             \
         g_enabled.load(std::memory_order_relaxed) &&                                          \
-        frame_source_initialized()) {                                                          \
+        frame_source_initialized() && frame_source_live()) { /* [V27] */                                                          \
         StreamRole role = stream_map_get_role(buf->stream);                                    \
-        if (stream_map_should_inject(role, buf->status)) {                                     \
+        if (stream_map_should_inject(role, buf->status) &&                               \
+        (!g_rtrn_snapshot_only || role == STREAM_ROLE_SNAPSHOT)) {                     \
             FrameData src;                                                                     \
             if (frame_source_get_latest(&src)) {                                               \
                 g_rtrn_locked_inject_attempt[IDX].fetch_add(1);                               \
@@ -1068,6 +1185,11 @@ int hook_proxy_install(void) {
 
 
 
+        if (pcr.variant == PCR_VARIANT_UNKNOWN || !pcr.ptr) {
+            LOGW("PCR[%d]: variant=UNKNOWN — skipping hook to prevent crash", i);
+            continue;
+        }
+
         if (pcr.variant == PCR_VARIANT_HIDL_3_4 ||
             pcr.variant == PCR_VARIANT_HIDL_3_2 ||
             pcr.variant == PCR_VARIANT_AIDL) {
@@ -1133,11 +1255,6 @@ int hook_proxy_install(void) {
             }
             void *rob_hook = g_rob_proxy_table[g_rob_stub_count];
 
-
-
-
-
-
             void *rob_addr = pcr.ptr;
             if (pcr.size > 0 && pcr.size <= 16 && pcr.ptr) {
                 const uint32_t insn = *((const uint32_t *)pcr.ptr);
@@ -1155,7 +1272,6 @@ int hook_proxy_install(void) {
                          i, pcr.size, insn);
                 }
             }
-
 
             if (rob_addr) {
                 uint32_t insn0 = *((const uint32_t *)rob_addr);
@@ -1181,38 +1297,19 @@ int hook_proxy_install(void) {
             continue;
         }
 
+        if (pcr.variant != PCR_VARIANT_MEMBER) {
+            LOGW("PCR[%d]: variant=%d is not a supported member function — skipping to prevent crash",
+                 i, pcr.variant);
+            continue;
+        }
+
         void *hook_fn   = g_pcr_proxy_table[g_pcr_stub_count];
         void *hook_addr = pcr.ptr;
-
-
-        if (pcr.variant == PCR_VARIANT_OUTPUTUTILS &&
-            pcr.size > 0 && pcr.size <= 16 && pcr.ptr) {
-            const uint32_t insn = *((const uint32_t *)pcr.ptr);
-            if ((insn >> 26) == 0x05u) {
-                uint32_t imm26  = insn & 0x03FFFFFFu;
-                int32_t  simm26 = (imm26 & 0x02000000u)
-                                  ? (int32_t)(imm26 | 0xFC000000u)
-                                  : (int32_t)imm26;
-                void *real_target = (uint8_t *)pcr.ptr + simm26 * 4;
-                LOGI("PCR[%d]: OutputUtils thunk B→0x%08x at %p: following to real impl %p",
-                     i, insn, pcr.ptr, real_target);
-                hook_addr = real_target;
-            } else {
-                LOGW("PCR[%d]: OutputUtils size=%zu but insn=0x%08x not B — hooking addr as-is",
-                     i, pcr.size, insn);
-            }
-        }
 
         if (g_pcr_stub_count >= MAX_PCR_VARIANTS) {
             LOGW("PCR[%d]: PCR table full, skipping", i);
             continue;
         }
-
-
-
-
-
-
 
         if (hook_addr) {
             uint32_t insn0 = *((const uint32_t *)hook_addr);
@@ -1238,14 +1335,13 @@ int hook_proxy_install(void) {
         }
     }
 
-    int total_hooks = g_pcr_stub_count + g_rob_stub_count;
-    if (total_hooks == 0) {
-        LOGE("All PCR/ROB hook attempts failed — frame injection will NOT work");
-        g_init_done.store(0);
-        return -1;
+    if (g_rob_stub_count == 0 && g_pcr_stub_count == 0) {
+        LOGW("Neither ROB nor PCR member hook installed from PCR scan. "
+             "Will attempt Camera3OutputStream::returnBuffer / returnBufferLocked next.");
+    } else {
+        LOGI("PCR: %d hook(s) installed  ROB: %d hook(s) installed",
+             g_pcr_stub_count, g_rob_stub_count);
     }
-    LOGI("PCR: %d hook(s) installed  ROB: %d hook(s) installed",
-         g_pcr_stub_count, g_rob_stub_count);
 
     if (g_rob_stub_count == 0) {
         LOGW("WARNING: returnOutputBuffers hook not installed. "
@@ -1357,14 +1453,25 @@ int hook_proxy_install(void) {
     LOGI("hook_proxy_install: resolving Camera3OutputStream::returnBuffer "
          "(OPlus primary per-buffer injection point)...");
     if (g_rob_stub_count > 0) {
-        LOGI("Camera3OutputStream::returnBuffer: skipping — ROB hook(s) installed (%d). "
-             "returnBuffer fires WITHIN returnOutputBuffers; having both active causes "
-             "double-injection of the same buffer (two different frames written to one buffer). "
-             "ROB handles all injection on this device.",
+        /* [V13] ROB handles preview/video; JPEG BLOB buffers never reach it.
+         * Install returnBuffer too, but gated to SNAPSHOT role only so no
+         * buffer can be injected twice. */
+        g_rtrn_snapshot_only = true;
+        LOGI("Camera3OutputStream::returnBuffer: ROB hook(s) installed (%d) — "
+             "installing returnBuffer in SNAPSHOT-only mode (photo capture fix).",
              g_rob_stub_count);
     } else {
+        g_rtrn_snapshot_only = false;
         ResolvedSymbol rtrn_syms[MAX_RTRN_VARIANTS];
-        int rtrn_count = resolve_camera3_returnbuffer(rtrn_syms, MAX_RTRN_VARIANTS);
+        /* [V59] exactly-one invariant enforced for real: old comments claimed
+         * "skipped if ROB active" but nothing gated the install. With ROB+RTRN
+         * both live a buffer is processed twice -> use-after-free (Samsung
+         * A03s tombstone_20: null weakref inside returnOutputBuffers under
+         * my_rob_proxy_0; TECNO logged "Multiple injection hooks active (2)"). */
+        int rtrn_count = (g_rob_stub_count == 0)
+                       ? resolve_camera3_returnbuffer(rtrn_syms, MAX_RTRN_VARIANTS) : 0;
+        if (g_rob_stub_count > 0)
+            LOGI("RTRN: skipped — ROB active (exactly-one invariant)");
 
         for (int i = 0; i < rtrn_count && g_rtrn_stub_count < MAX_RTRN_VARIANTS; i++) {
             void *stub = shadowhook_hook_sym_addr(
@@ -1407,19 +1514,38 @@ int hook_proxy_install(void) {
     LOGI("hook_proxy_install: resolving Camera3OutputStream::returnBufferLocked "
          "(OPlus fallback per-buffer injection point, fence-wait before write)...");
     if (g_rob_stub_count > 0 || g_rtrn_stub_count > 0) {
-        LOGI("Camera3OutputStream::returnBufferLocked: skipping — higher-priority "
-             "injection hook(s) already installed (ROB=%d RTRN=%d). "
-             "returnBufferLocked fires WITHIN the returnBuffer/returnOutputBuffers call "
-             "chain; both active = double-injection of the same buffer.",
+        /* [V19 A14 photo] 14.mediatek.5: ROB/RTRN cannot map BLOB buffers —
+         * their handles are HIDL transport wrappers ("resolve_ahwb: ALL mapping
+         * methods failed ... not a real gralloc handle"), so photos came out as
+         * real frames. returnBufferLocked receives REAL GraphicBuffer handles.
+         * Install it SNAPSHOT-only instead of skipping: YUV stays on ROB/RTRN
+         * (no double-injection), JPEG finally gets a working entry point. */
+        g_rtrn_snapshot_only = true;
+        LOGI("Camera3OutputStream::returnBufferLocked: installing as SNAPSHOT-only "
+             "JPEG injector (ROB=%d RTRN=%d stay primary for YUV).",
              g_rob_stub_count, g_rtrn_stub_count);
-    } else {
+    }
+    {
         ResolvedSymbol rtrn_locked_syms[MAX_RTRN_LOCKED_VARIANTS];
-        int rtrn_locked_count = resolve_camera3_returnbufferlocked(
-            rtrn_locked_syms, MAX_RTRN_LOCKED_VARIANTS);
+        int rtrn_locked_count = (g_rob_stub_count == 0 && g_rtrn_stub_count == 0)
+                       ? resolve_camera3_returnbufferlocked(
+                             rtrn_locked_syms, MAX_RTRN_LOCKED_VARIANTS) : 0;
+        if (g_rob_stub_count > 0 || g_rtrn_stub_count > 0)
+            LOGI("RTRN_LOCKED: skipped — ROB/RTRN active (exactly-one invariant)");
 
         for (int i = 0; i < rtrn_locked_count && g_rtrn_locked_stub_count < MAX_RTRN_LOCKED_VARIANTS; i++) {
+            void *hook_addr = rtrn_locked_syms[i].ptr;
+            if (hook_addr) {
+                uint32_t insn0 = *((const uint32_t *)hook_addr);
+                if (insn0 == 0xD503237Fu || insn0 == 0xD503257Fu || insn0 == 0xD503213Fu) {
+                    LOGI("RTRN_LOCKED[%d]: addr=%p starts with PAC instruction 0x%08x "
+                         "— skipping to prevent SIGILL (OPlus Android 14 PAC trampoline bug)",
+                         i, hook_addr, insn0);
+                    continue;
+                }
+            }
             void *stub = shadowhook_hook_sym_addr(
-                rtrn_locked_syms[i].ptr,
+                hook_addr,
                 g_rtrn_locked_proxy_table[g_rtrn_locked_stub_count],
                 nullptr);
             if (stub) {

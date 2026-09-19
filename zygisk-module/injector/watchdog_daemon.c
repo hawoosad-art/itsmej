@@ -86,7 +86,33 @@ static pid_t get_cameraserver_pid(void) {
     return 0;
 }
 
+/* V4.9.16 liveness probe: is the hook actually serving frames?
+ * The abstract AF_UNIX socket "\0amkush_frame_fd" is bound ONLY by libhookProxy,
+ * and only once its detached init thread has finished. A hook mapping alone does
+ * not prove the injection works — if init fails, the .so stays mapped but nothing
+ * binds the socket, and frame_producer gets "Connection refused". Abstract sockets
+ * appear in /proc/net/unix prefixed with '@'. Returns:
+ *   1  live     0  confirmed absent   -1  unreadable (unknown) */
+static int hook_socket_live(void) {
+    FILE *f = fopen("/proc/net/unix", "r");
+    if (!f) return -1;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "@amkush_frame_fd")) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static int is_hooked(pid_t pid) {
+    int sock = hook_socket_live();
+    if (sock > 0) return 1;         /* IPC socket live → hook is serving frames */
+    if (sock == 0) return 0;        /* socket confirmed absent → dead, re-inject */
+    /* sock < 0: /proc/net/unix unreadable → fall back to the old maps heuristic */
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     FILE *f = fopen(maps_path, "r");

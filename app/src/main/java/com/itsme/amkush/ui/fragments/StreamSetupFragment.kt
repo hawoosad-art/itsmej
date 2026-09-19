@@ -47,43 +47,31 @@ private data class Protocol(
     val scheme: String? = null
 )
 
+/* [V74] RTSP + RTMP + local files only. Owner directive: the stream
+ * picker must match the shipped plugin set — V73 dropped every other
+ * streaming protocol from the GStreamer build, so offering HLS/DASH/SRT/
+ * MMS/FTP/HTTP here could only produce dead streams. */
 private val PROTOCOLS = listOf(
-    Protocol("hls",    "HLS",    ".m3u8",    scheme = null),
     Protocol("rtmp",   "RTMP",   "rtmp://",  scheme = "rtmp"),
     Protocol("rtsp",   "RTSP",   "rtsp://",  scheme = "rtsp"),
-    Protocol("dash",   "DASH",   ".mpd",     scheme = null),
-    Protocol("rtp",    "RTP",    "rtp://",   scheme = "rtp"),
-    Protocol("udp",    "UDP",    "udp://",   scheme = "udp"),
-    Protocol("srt",    "SRT",    "srt://",   scheme = "srt"),
-    Protocol("mms",    "MMS",    "mms://",   scheme = "mms"),
-    Protocol("ftp",    "FTP",    "ftp://",   scheme = "ftp"),
-    Protocol("http",   "HTTP",   "http(s)://", scheme = "http"),
     Protocol("direct", "Direct", "mp4/webm", scheme = null),
 )
 
 private fun inferProtocolId(url: String): String {
-    if (url.isEmpty()) return "hls"
+    if (url.isEmpty()) return "rtsp"
     val lower = url.lowercase()
     return when {
-        lower.startsWith("rtsp://")  -> "rtsp"
-        lower.startsWith("rtmp://")  -> "rtmp"
-        lower.startsWith("srt://")   -> "srt"
-        lower.startsWith("udp://")   -> "udp"
-        lower.startsWith("rtp://")   -> "rtp"
-        lower.startsWith("mms://")   -> "mms"
-        lower.startsWith("ftp://")   -> "ftp"
-        lower.startsWith("https://") -> "http"
-        lower.startsWith("http://")  -> "http"
-        lower.endsWith(".m3u8") || lower.contains(".m3u8?") -> "hls"
-        lower.endsWith(".mpd")  || lower.contains(".mpd?")  -> "dash"
+        lower.startsWith("rtsp://")  || lower.startsWith("rtsps://") -> "rtsp"
+        lower.startsWith("rtmp://")  || lower.startsWith("rtmps://") -> "rtmp"
+        lower.startsWith("file://")  || lower.startsWith("content://") -> "direct"
         lower.startsWith("/")   -> "direct"
 
 
 
-        url.contains("://")     -> "hls"
+        url.contains("://")     -> "rtsp"
 
         url.matches(Regex("""[^/\s]+:\d{2,5}(/.*)?""")) -> "rtsp"
-        else                    -> "hls"
+        else                    -> "rtsp"
     }
 }
 
@@ -214,7 +202,7 @@ fun StreamSetupContent(
                     Toast.makeText(
                         context,
                         if (ok) "Native injection started for $appName"
-                        else "Native injection failed — check Zygisk module",
+                        else "Native injection failed — check root & hook status",
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -240,12 +228,26 @@ fun StreamSetupContent(
 
     fun stopInjection() {
         if (AppState.useNativeHook) {
-            NativeFrameProducer.stop()
-            OverlayService.stop(context)
-            AppState.injectionSource = null
-            AppState.activeTargetPackage = null
-            isInjecting = false
-            Toast.makeText(context, "Native injection stopped", Toast.LENGTH_SHORT).show()
+            /* [V80 ANR fix] nativeStop() tears the GStreamer pipeline down
+             * synchronously and blocked the UI thread past the 10 s watchdog.
+             * Field evidence: anr_14.txt from SM-X200 / Android 14 / V78 —
+             *   "main" RUNNABLE
+             *     at NativeFrameProducer.nativeStop(Native Method)
+             *     at NativeFrameProducer.stop
+             *     at StreamSetupContent$stopInjection
+             *     at ... dispatchTouchEvent
+             * Same Dispatchers.IO pattern MediaFragment.stopInjection() already
+             * uses; UI/state mutations stay on Main. */
+            scope.launch(Dispatchers.IO) {
+                NativeFrameProducer.stop()
+                withContext(Dispatchers.Main) {
+                    OverlayService.stop(context)
+                    AppState.injectionSource = null
+                    AppState.activeTargetPackage = null
+                    isInjecting = false
+                    Toast.makeText(context, "Native injection stopped", Toast.LENGTH_SHORT).show()
+                }
+            }
             return
         }
         InjectionService.stop(context)
@@ -266,9 +268,9 @@ fun StreamSetupContent(
             },
             text = {
                 Text(
-                    "FaceGate needs the \"Display over other apps\" permission to show " +
+                    "EcomCam needs the \"Display over other apps\" permission to show " +
                     "pan/zoom floating controls while injection is active.\n\n" +
-                    "Tap \"Open Settings\", find FaceGate in the list, and enable the toggle.",
+                    "Tap \"Open Settings\", find EcomCam in the list, and enable the toggle.",
                     color = Color(0xAAFFFFFF), fontSize = 13.sp
                 )
             },
@@ -361,22 +363,22 @@ fun StreamSetupContent(
                                         scope.launch(Dispatchers.IO) {
                                             val ok = NativeFrameProducer.startWithUri(context, uri)
                                             withContext(Dispatchers.Main) {
-                                                AppState.injectionSource = "stream"
+                                                AppState.injectionSource = "media"
                                                 isInjecting = ok
                                                 isStarting = false
                                                 Toast.makeText(
                                                     context,
-                                                    if (ok) "Injection started" else "Injection failed",
+                                                    if (ok) "Injection started (Local Media)" else "Injection failed",
                                                     Toast.LENGTH_SHORT
                                                 ).show()
                                             }
                                         }
                                     }
                                 } else {
-                                    InjectionService.start(context, p, mediaUri = mUri)
-                                    AppState.injectionSource = "stream"
+                                    InjectionService.start(context, p, mediaUri = mUri, streamUrl = null)
+                                    AppState.injectionSource = "media"
                                     isInjecting = true
-                                    Toast.makeText(context, "Injection started", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Injection started (Local Media)", Toast.LENGTH_SHORT).show()
                                 }
                             }
                             .padding(horizontal = 14.dp, vertical = 9.dp),
@@ -413,10 +415,10 @@ fun StreamSetupContent(
                                     }
                                 } else {
                                     SharedPrefs.setLastUsedUrl(null)
-                                    InjectionService.start(context, p, streamUrl = sUrl)
+                                    InjectionService.start(context, p, streamUrl = sUrl, mediaUri = null)
                                     AppState.injectionSource = "stream"
                                     isInjecting = true
-                                    Toast.makeText(context, "Injection started", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Injection started (Live Stream)", Toast.LENGTH_SHORT).show()
                                 }
                             }
                             .padding(horizontal = 14.dp, vertical = 9.dp),

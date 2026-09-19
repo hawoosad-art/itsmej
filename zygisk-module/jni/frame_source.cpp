@@ -3,7 +3,9 @@
 #include "frame_source.h"
 #include <android/log.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #include <string.h>
 #include <errno.h>
 #include <stdatomic.h>
@@ -56,18 +58,42 @@ static bool validate_slot_bounds(uint32_t slot_idx, size_t slot_sz,
     return true;
 }
 
+/* [V58 crash-fix] SIGSEGV frame_source_get_seq+16 (13.unisoc.2 tombstone_00,
+ * fault addr = stale ring base + 0x34): init() used to munmap the OLD ring
+ * before mmapping the new one, so a camera thread inside conv_cache_key()
+ * could dereference the old g_map_base mid-remap. The old mapping is now
+ * kept alive and reaped by a detached thread after 2 s — readers always see
+ * either the old or the new, always-mapped, ring. */
+static void schedule_delayed_unmap(void *base, size_t size) {
+    if (!base || base == MAP_FAILED || size == 0) return;
+    struct ReaperArgs { void *b; size_t s; };
+    ReaperArgs *a = new ReaperArgs{base, size};
+    pthread_t t;
+    if (pthread_create(&t, nullptr, [](void *p) -> void * {
+            ReaperArgs *args = (ReaperArgs *)p;
+            struct timespec ts = {2, 0};
+            nanosleep(&ts, nullptr);
+            munmap(args->b, args->s);
+            delete args;
+            return nullptr;
+        }, a) != 0) {
+        munmap(base, size);   // last resort: old behavior, but no leak
+        delete a;
+    } else {
+        pthread_detach(t);
+    }
+}
+
 int frame_source_init(int ashmem_fd) {
     pthread_mutex_lock(&g_lock);
 
-    /* BUG-FIX: clear initialized flag BEFORE munmap so concurrent injection
-     * threads cannot read from the about-to-be-freed mapping.  Without this
-     * a second nativeStart() call causes a use-after-free race. */
+    /* [V58] flag first, but the OLD mapping stays mapped until the new one is
+     * fully validated and published (see schedule_delayed_unmap). Readers
+     * during this window get defaults (flag false) — never a dangling ptr. */
     g_initialized.store(false, std::memory_order_release);
 
-    if (g_map_base != MAP_FAILED) {
-        munmap(g_map_base, g_map_size);
-        g_map_base = MAP_FAILED;
-    }
+    void *old_base = g_map_base;
+    size_t old_size = g_map_size;
     if (g_ashmem_fd >= 0) {
         close(g_ashmem_fd);
     }
@@ -152,9 +178,8 @@ int frame_source_init(int ashmem_fd) {
     LOGI("frame_source_init: %ux%u stride=%u fmt=%u slot_sz=%zu total=%zu",
          w, h, stride, fmt, slot_sz, total);
 
-
-
     g_initialized.store(true, std::memory_order_release);
+    schedule_delayed_unmap(old_base, old_size);   // [V58] safe: new ring published
     pthread_mutex_unlock(&g_lock);
     return 0;
 }
@@ -164,8 +189,11 @@ void frame_source_destroy(void) {
 
     g_initialized.store(false, std::memory_order_release);
     pthread_mutex_lock(&g_lock);
+    void *old_base = MAP_FAILED;
+    size_t old_size = 0;
     if (g_map_base != MAP_FAILED) {
-        munmap(g_map_base, g_map_size);
+        old_base = g_map_base;
+        old_size = g_map_size;
         g_map_base = MAP_FAILED;
     }
     g_ashmem_fd   = -1;
@@ -173,6 +201,7 @@ void frame_source_destroy(void) {
     g_slot_stride = 0;
     g_slot_format = 0;
     pthread_mutex_unlock(&g_lock);
+    schedule_delayed_unmap(old_base, old_size);   // [V58] reap after readers drain
 }
 
 bool frame_source_initialized(void) {
@@ -295,6 +324,27 @@ uint32_t frame_source_get_manual_rotation(void) {
                ->load(std::memory_order_relaxed);
 }
 
+bool frame_source_live(void) {
+    FrameSourceHeader *hdr = (FrameSourceHeader *)g_map_base;
+    if (!hdr) return false;
+    uint32_t hb = reinterpret_cast<std::atomic<uint32_t>*>(&hdr->heartbeat_ms32)
+                      ->load(std::memory_order_acquire);
+    if (hb == 0) return false;   // producer never started
+    struct timespec ts; clock_gettime(CLOCK_BOOTTIME, &ts);
+    uint32_t now = (uint32_t)((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (now - hb) < 2500u;   // unsigned wrap-safe age check
+}
+
+uint32_t frame_source_get_seq(void) {
+    /* [V58] was the tombstone_00 crash site: no g_initialized check and a
+     * bare null test that MAP_FAILED ((void*)-1) sails through. */
+    if (!g_initialized.load(std::memory_order_acquire)) return 0u;
+    FrameSourceHeader *hdr = (FrameSourceHeader *)g_map_base;
+    if (!hdr || hdr == MAP_FAILED) return 0u;
+    return reinterpret_cast<std::atomic<uint32_t>*>(&hdr->frame_seq)
+        ->load(std::memory_order_acquire);
+}
+
 uint32_t frame_source_get_total_rotation(void) {
     if (!g_initialized.load(std::memory_order_acquire)) return 0u;
     FrameSourceHeader *hdr = (FrameSourceHeader *)g_map_base;
@@ -303,4 +353,21 @@ uint32_t frame_source_get_total_rotation(void) {
     uint32_t man = reinterpret_cast<std::atomic<uint32_t>*>(&hdr->manual_rotation)
                        ->load(std::memory_order_relaxed);
     return (src + man) % 360u;
+}
+
+// [gstreamer.4] Chroma A/B override for the opaque 0x22 stream (shared header).
+// -1 = unset (use build default), 0 = NV12, 1 = NV21.
+int32_t frame_source_get_chroma_override(void) {
+    if (!g_initialized.load(std::memory_order_acquire)) return -1;
+    FrameSourceHeader *hdr = (FrameSourceHeader *)g_map_base;
+    return reinterpret_cast<std::atomic<int32_t>*>(&hdr->chroma_override)
+               ->load(std::memory_order_acquire);
+}
+
+void frame_source_set_chroma_override(int32_t override_is_nv21) {
+    if (!g_initialized.load(std::memory_order_acquire)) return;
+    const int32_t v = (override_is_nv21 > 1) ? 1 : (override_is_nv21 < 0 ? -1 : override_is_nv21);
+    FrameSourceHeader *hdr = (FrameSourceHeader *)g_map_base;
+    reinterpret_cast<std::atomic<int32_t>*>(&hdr->chroma_override)
+        ->store(v, std::memory_order_release);
 }

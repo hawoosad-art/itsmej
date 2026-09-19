@@ -1,5 +1,18 @@
 #include "KittyTrace.hpp"
 
+/* [V61] SIGTRAP/SIGSTOP must NEVER be re-injected into the tracee when
+ * resuming after an unexpected stop: SIGTRAP's default action killed
+ * cameraserver on Mi A1 (every "didn't stop after syscall" was followed
+ * by "No such process"). Trap/stop signals are injector artifacts —
+ * suppress them; pass real signals through. */
+static inline int kittyReinjectSig(int status)
+{
+    int sig = WSTOPSIG(status);
+    if (sig == SIGTRAP || sig == SIGSTOP || sig == SIGTSTP)
+        return 0;
+    return sig;
+}
+
 bool KittyTraceMgr::attach(int options)
 {
     if (_pid <= 0)
@@ -637,7 +650,7 @@ kitty_rp_call_t KittyTraceMgr::_callFunctionFrom(uintptr_t callerAddress, uintpt
                        map.toString().c_str());
         }
 
-        if (!cont(WSTOPSIG(status)))
+        if (!cont(kittyReinjectSig(status)))
             return failure_return(KT_RP_CALL_CONT_FAILED);
 
         return failure_return(KT_RP_CALL_MISMATCH_STOP);
@@ -821,6 +834,8 @@ kitty_rp_call_t KittyTraceMgr::_callSyscall(long sysnr, int nargs, ...)
     if (!step())
         return failure_return(KT_RP_CALL_STEP_FAILED);
 
+    /* [V61] old-kernel single-step retry budget (see wait loop) */
+    int step_fix_retries = 0;
 
     do
     {
@@ -864,6 +879,27 @@ kitty_rp_call_t KittyTraceMgr::_callSyscall(long sysnr, int nargs, ...)
         if (return_regs.KT_REG_PC > tmp_regs.KT_REG_PC && return_regs.KT_REG_PC <= tmp_regs.KT_REG_PC + 16)
             break;
 
+        /* [V61] Mi A1 (kernel 4.9): PTRACE_SINGLESTEP over svc consumes the
+         * step in the exception — the stop reports TRAP_TRACE with the PC
+         * still ON the stub, so the "PC advanced" check above fails even
+         * though nothing is wrong. Step again: the syscall then executes
+         * and the next stop lands past the stub. Newer kernels (5.x) never
+         * reach this branch because the first step advances. */
+        if (return_regs.KT_REG_PC == tmp_regs.KT_REG_PC && step_fix_retries < 3)
+        {
+            siginfo_t si_pre = {};
+            getSignalInfo(&si_pre);
+            if (si_pre.si_signo == SIGTRAP)
+            {
+                step_fix_retries++;
+                KITTY_LOGI("callSyscall(%d): step-trap on svc (old-kernel SS) — stepping again (%d/3)",
+                           int(sysnr), step_fix_retries);
+                if (!step())
+                    return failure_return(KT_RP_CALL_STEP_FAILED);
+                continue;
+            }
+        }
+
         KITTY_LOGE("callSyscall(%d): Process didn't stop after syscall!", int(sysnr));
 
         KITTY_LOGE("callSyscall(%d): PC(%p) | RET(%p).",
@@ -889,7 +925,7 @@ kitty_rp_call_t KittyTraceMgr::_callSyscall(long sysnr, int nargs, ...)
                        map.toString().c_str());
         }
 
-        if (!cont(WSTOPSIG(status)))
+        if (!cont(kittyReinjectSig(status)))
             return failure_return(KT_RP_CALL_CONT_FAILED);
 
         return failure_return(KT_RP_CALL_MISMATCH_STOP);
@@ -1075,7 +1111,7 @@ again:
                        map.toString().c_str());
         }
 
-        if (!cont(WSTOPSIG(status)))
+        if (!cont(kittyReinjectSig(status)))
             return failure_return(KT_BP_CONT_FAILED);
 
         return failure_return(KT_BP_MISMATCH_STOP);
@@ -1274,7 +1310,7 @@ again:
                        map.toString().c_str());
         }
 
-        if (!cont(WSTOPSIG(status)))
+        if (!cont(kittyReinjectSig(status)))
             return failure_return(KT_BP_CONT_FAILED);
 
 

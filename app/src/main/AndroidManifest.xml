@@ -31,9 +31,18 @@
         </intent>
     </queries>
 
+    <!-- [V91] NO BACKUP / NO RESTORE. allowBackup="true" let Google cloud
+         backup snapshot the whole app data dir - including files/fg_lic.bin
+         (the encrypted activation token) and the SharedPrefs paid/trial
+         flags - and Android silently restored it on reinstall. That is why an
+         uninstalled+reinstalled production build came back already activated
+         with no key entered. Backup is off now, and every domain is also
+         excluded via dataExtractionRules for API 31+. -->
     <application
         android:name=".FaceGateApplication"
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:fullBackupOnly="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -50,7 +59,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="FaceGate - FFmpeg Virtual Camera" />
+            android:value="FaceGate - GStreamer Virtual Camera" />
         <meta-data
             android:name="xposedminversion"
             android:value="89" />
@@ -105,6 +114,12 @@
             android:foregroundServiceType="mediaPlayback"
             android:enabled="true" />
 
+        <service
+            android:name=".services.RebootMonitorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:enabled="true" />
+
         <!-- ==================== RECEIVERS ==================== -->
 
         <receiver
@@ -112,6 +127,18 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="com.itsme.amkush.ACTION_RESET_SAFETY" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".notification.RebootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <data android:scheme="package" />
             </intent-filter>
         </receiver>
 

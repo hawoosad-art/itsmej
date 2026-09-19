@@ -17,16 +17,8 @@ object SharedPrefs {
     private const val KEY_IS_TRIAL = "is_trial"
     private const val KEY_TRIAL_EXPIRY = "trial_expiry"
     private const val KEY_DENY_LIST = "deny_list"
-    private const val KEY_SPOOF_MODEL = "spoof_model"
-    private const val KEY_SPOOF_BRAND = "spoof_brand"
-    private const val KEY_SPOOF_MANUFACTURER = "spoof_manufacturer"
-    private const val KEY_SPOOF_ANDROID = "spoof_android"
-    private const val KEY_SPOOF_BUILD_ID = "spoof_build_id"
-    private const val KEY_SPOOF_SECURITY_PATCH = "spoof_security_patch"
-    private const val KEY_SPOOF_ACTIVE = "spoof_active"
-    private const val KEY_SPOOF_DEVICE_ID = "spoof_device_id"
-    private const val KEY_SPOOF_SERIAL = "spoof_serial"
     private const val KEY_LAST_USED_URL   = "last_used_url"
+    private const val KEY_LAST_USED_SLOT  = "last_used_slot"
     private const val KEY_ROOT_MODE      = "root_mode"
     private const val KEY_MODE_SELECTED  = "mode_selected"
     private const val KEY_TRIAL_WIFI_IP  = "trial_wifi_ip"
@@ -133,6 +125,14 @@ object SharedPrefs {
         p?.edit { putString(KEY_LAST_USED_URL, url) }
     }
 
+    /* [V87] which slot the last-used URL belongs to — restore must not
+     * clobber a slot the user filled with different media. */
+    fun getLastUsedSlot(): Int = p?.getInt(KEY_LAST_USED_SLOT, 0) ?: 0
+
+    fun setLastUsedSlot(slot: Int) {
+        p?.edit { putInt(KEY_LAST_USED_SLOT, slot) }
+    }
+
 
 
     fun getDenyList(): Set<String> = p?.getStringSet(KEY_DENY_LIST, emptySet()) ?: emptySet()
@@ -157,59 +157,14 @@ object SharedPrefs {
 
 
 
-    fun getSpoofModel(): String? = p?.getString(KEY_SPOOF_MODEL, null)
 
-    fun setSpoofModel(model: String?) {
-        p?.edit { putString(KEY_SPOOF_MODEL, model) }
-    }
 
-    fun getSpoofBrand(): String? = p?.getString(KEY_SPOOF_BRAND, null)
 
-    fun setSpoofBrand(brand: String?) {
-        p?.edit { putString(KEY_SPOOF_BRAND, brand) }
-    }
 
-    fun getSpoofManufacturer(): String? = p?.getString(KEY_SPOOF_MANUFACTURER, null)
 
-    fun setSpoofManufacturer(manufacturer: String?) {
-        p?.edit { putString(KEY_SPOOF_MANUFACTURER, manufacturer) }
-    }
 
-    fun getSpoofAndroid(): String? = p?.getString(KEY_SPOOF_ANDROID, null)
 
-    fun setSpoofAndroid(androidVersion: String?) {
-        p?.edit { putString(KEY_SPOOF_ANDROID, androidVersion) }
-    }
 
-    fun getSpoofBuildId(): String? = p?.getString(KEY_SPOOF_BUILD_ID, null)
-
-    fun setSpoofBuildId(buildId: String?) {
-        p?.edit { putString(KEY_SPOOF_BUILD_ID, buildId) }
-    }
-
-    fun getSpoofSecurityPatch(): String? = p?.getString(KEY_SPOOF_SECURITY_PATCH, null)
-
-    fun setSpoofSecurityPatch(patch: String?) {
-        p?.edit { putString(KEY_SPOOF_SECURITY_PATCH, patch) }
-    }
-
-    fun isSpoofActive(): Boolean = p?.getBoolean(KEY_SPOOF_ACTIVE, false) ?: false
-
-    fun setSpoofActive(active: Boolean) {
-        p?.edit { putBoolean(KEY_SPOOF_ACTIVE, active) }
-    }
-
-    fun getSpoofDeviceId(): String? = p?.getString(KEY_SPOOF_DEVICE_ID, null)
-
-    fun setSpoofDeviceId(deviceId: String?) {
-        p?.edit { putString(KEY_SPOOF_DEVICE_ID, deviceId) }
-    }
-
-    fun getSpoofSerial(): String? = p?.getString(KEY_SPOOF_SERIAL, null)
-
-    fun setSpoofSerial(serial: String?) {
-        p?.edit { putString(KEY_SPOOF_SERIAL, serial) }
-    }
 
 
 

@@ -1,5 +1,6 @@
 package com.itsme.amkush.logging
 
+import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -27,7 +28,43 @@ object TelegramLogSender {
     // e.g. "full_facegate_log_13.txt" for Android 13
     private val androidVersion: String get() = Build.VERSION.RELEASE.split(".").first()
     private val logFileName: String   get() = "${LOG_PREFIX}_${androidVersion}.txt"
-    private val logPath: String       get() = "$LOG_DIR/$logFileName"
+    /* [V86] root-optional capture. On CPH2387 the sender's su children die
+     * with SIGTRAP (dropbox tombstone 17:57: "su -c cat .../camera_realtime
+     * _debug_14.log" >>> su <<< signal 5) so /data/local/tmp capture can
+     * never exist there. Fallback = app-uid logcat (logd lets an app read
+     * its OWN lines — all our tags) into filesDir, which needs no root. */
+    @Volatile private var appContext: Context? = null
+    @Volatile private var useFallback = false
+    private val fallbackPath: String get() = "${appContext?.filesDir}/amkush_live_tg.txt"
+    private val bootDiagPath: String get() = "${appContext?.filesDir}/sender_boot_diag.txt"
+    private val rootLogPath: String  get() = "$LOG_DIR/$logFileName"
+    private val logPath: String      get() = if (useFallback) fallbackPath else rootLogPath
+
+    private fun diag(msg: String) {
+        try { File(bootDiagPath).appendText("${System.currentTimeMillis()} [$TAG] $msg\n") } catch (_: Exception) {}
+    }
+
+    /* su with a hard 10s timeout — a hung Magisk prompt must never freeze
+     * the handler thread; every outcome lands in the boot-diag file. */
+    private fun execRoot(cmd: String, tag: String): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            val err = StringBuilder()
+            val drain = Thread { try { p.errorStream.bufferedReader().forEachLine { err.appendLine(it) } } catch (_: Exception) {} }
+            drain.isDaemon = true; drain.start()
+            val waiter = Thread { try { p.waitFor() } catch (_: Exception) {} }
+            waiter.isDaemon = true; waiter.start()
+            waiter.join(10_000)
+            if (waiter.isAlive) { p.destroy(); diag("$tag: su TIMEOUT, destroyed"); return false }
+            drain.join(500)
+            val ec = try { p.exitValue() } catch (_: Exception) { -1 }
+            diag("$tag: exit=$ec err=${err.toString().trim().take(180)}")
+            ec == 0
+        } catch (e: Exception) {
+            diag("$tag: exec threw ${e.message}")
+            false
+        }
+    }
 
     // Use >> (append) so the header written by Java is preserved.
     // CRITICAL: pipe logcat through `grep --line-buffered`. logcat fully-buffers
@@ -36,13 +73,23 @@ object TelegramLogSender {
     // which is why full_facegate_log_*.txt stayed empty. grep --line-buffered
     // forces every line through to the file immediately. This matches the pattern
     // proven to work in CameraDebugLogSender.
+    private val FILTER: String get() = "amkush/|ModuleManager|InjectionService|EcomCam|FaceGateApplication|" +
+        "NativeFrameProducer|FrameProducerNativeLoader|hookProxy|shadowhook|" +
+        "frame_producer|frame_inject|OverlayService|DECODER|AmkushDecoder|StreamPreview|" +
+        "Telegram.*upload|forceSendNow|Log grew by"
+    private val diagPath: String get() = "$LOG_DIR/tg_sender_diag.txt"
     private val LOGCAT_CMD get() = arrayOf(
         "su", "-c",
-        "logcat -b all -v threadtime | grep --line-buffered -i -E " +
-        "'amkush/|ModuleManager|InjectionService|FaceGate|FaceGateApplication|" +
-        "hookProxy|shadowhook|frame_producer|frame_inject|OverlayService|" +
-        "Telegram.*upload|forceSendNow|Log grew by' " +
-        ">> ${logPath}"
+        "( logcat -b all -v threadtime 2>>$diagPath | grep --line-buffered -i -E " +
+        "'$FILTER' " +
+        ") >> ${logPath} 2>>$diagPath"
+    )
+
+    /* [V86] app-uid pipeline: no su anywhere. logd filters to our own uid,
+     * which carries every amkush/EcomCam/AmkushDecoder/StreamPreview line. */
+    private val FALLBACK_CMD get() = arrayOf(
+        "sh", "-c",
+        "logcat -v threadtime 2>>$bootDiagPath | grep --line-buffered -i -E '$FILTER' >> $fallbackPath 2>>$bootDiagPath"
     )
 
     @Volatile private var handlerThread: HandlerThread? = null
@@ -56,15 +103,38 @@ object TelegramLogSender {
 
 
     @Synchronized
-    fun start() {
+    fun start(context: Context) {
         if (handlerThread != null) return
-        deleteOldLogFiles()
+        appContext = context.applicationContext
         val ht = HandlerThread("facegate-log-sender").also { it.start(); handlerThread = it }
         val h  = Handler(ht.looper).also { handler = it }
-        h.post { doStart() }
+        h.post {
+            /* [V58] Archive-before-rotate: the old start() deleted the
+             * previous session's log the instant the app restarted, and the
+             * 2 KB threshold send then pushed the fresh (hook-less) file over
+             * the good one on GitHub — the "auto-upload has no hook lines"
+             * incident. Upload the previous session first, THEN rotate. Runs
+             * on the handler thread so the main thread never blocks on HTTP. */
+            archiveOldLog()
+            deleteOldLogFiles()
+            doStart()
+        }
         Logger.i(TAG, "TelegramLogSender started — log=${logPath} threshold=${SEND_THRESHOLD_BYTES}B")
     }
 
+
+    /** [V58] Push the pre-restart log to GitHub before it is deleted, so a
+     *  restart can never destroy an un-uploaded camera session again. */
+    private fun archiveOldLog() {
+        try {
+            val bytes = readLogBytes() ?: return
+            if (bytes.size < SEND_THRESHOLD_BYTES) return
+            Logger.i(TAG, "archiving pre-restart log (${bytes.size} bytes) to GitHub before rotate")
+            uploadToGitHub(bytes)
+        } catch (e: Exception) {
+            Logger.w(TAG, "archiveOldLog failed: ${e.message}")
+        }
+    }
 
     @Synchronized
     fun stop() {
@@ -76,19 +146,19 @@ object TelegramLogSender {
         Logger.i(TAG, "TelegramLogSender stopped")
     }
 
-    /** Force-upload the current FaceGate log to Telegram + GitHub immediately.
+    /** Force-upload the current EcomCam log to Telegram + GitHub immediately.
      *  Reliable manual fallback when the automatic threshold send hasn't fired. */
     @Synchronized
     fun forceSendNow(): String {
         val bytes = readLogBytes()
-        if (bytes == null || bytes.isEmpty()) return "FaceGate log not found or empty"
-        Logger.i(TAG, "forceSendNow: sending FaceGate log (${bytes.size} bytes) to Telegram")
+        if (bytes == null || bytes.isEmpty()) return "EcomCam log not found or empty"
+        Logger.i(TAG, "forceSendNow: sending EcomCam log (${bytes.size} bytes) to Telegram")
         val ok = doSend(bytes, bytes.size.toLong())
         val gh = uploadToGitHub(bytes)
         val parts = mutableListOf<String>()
-        if (ok) parts.add("FaceGate log sent (${bytes.size / 1024} KB)")
+        if (ok) parts.add("EcomCam log sent (${bytes.size / 1024} KB)")
         if (gh) parts.add("GitHub uploaded")
-        if (parts.isEmpty()) return "FaceGate log send FAILED"
+        if (parts.isEmpty()) return "EcomCam log send FAILED"
         return parts.joinToString(" · ")
     }
 
@@ -99,21 +169,43 @@ object TelegramLogSender {
      * the auto-send never firing. Reading via root always works.
      */
     private fun readLogBytes(): ByteArray? {
+        /* [V99] OOM fix (the REAL cause of "closes during animation"): a runaway
+         * log (per-second camera fps lines etc.) grew to ~96MB; readBytes() slurped
+         * the whole file and GitHubLogUploader Base64-encoded it -> ~128MB
+         * allocation -> java.lang.OutOfMemoryError on this (facegate-log-sender)
+         * thread, which killed the process mid-splash. Read only the TAIL so the
+         * upload can never OOM regardless of how big the file gets. */
+        val maxBytes = 768 * 1024
         // Try direct Java read first (works when perms allow).
         try {
             val f = File(logPath)
             if (f.exists() && f.canRead() && f.length() > 0L) {
-                return f.readBytes()
+                return readTail(f, maxBytes)
             }
         } catch (_: Exception) {}
-        // Fallback: read via root `su cat`.
+        /* [V86] only su-cat when the file actually exists — on CPH2387 the
+         * repeated su-cat of a MISSING file was SIGTRAP-tombstoning every
+         * 3s check cycle. [V99] `tail -c` keeps the root path size-capped too. */
+        if (!File(logPath).exists()) return null
         return try {
-            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cat '$logPath' 2>/dev/null"))
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "tail -c $maxBytes '$logPath' 2>/dev/null"))
             val bytes = p.inputStream.readBytes()
             p.waitFor()
             bytes
         } catch (_: Exception) {
             null
+        }
+    }
+
+    /** [V99] Read at most the last `max` bytes of a file (whole file if smaller). */
+    private fun readTail(f: File, max: Int): ByteArray {
+        val len = f.length()
+        if (len <= max) return f.readBytes()
+        java.io.RandomAccessFile(f, "r").use { raf ->
+            raf.seek(len - max)
+            val buf = ByteArray(max)
+            raf.readFully(buf)
+            return buf
         }
     }
 
@@ -145,29 +237,77 @@ object TelegramLogSender {
 
 
     private fun doStart() {
+        /* [V92 LOGCAP] On unrooted devices this used to burn three failed root
+         * attempts before the watchdog flipped to the app-uid fallback
+         * (restart #1..#3, 15 s apart), so roughly the first 45 s of every
+         * session was never captured — exactly the window a preview test lives
+         * in. Probe su once up front and start in the right mode. */
+        if (!suAvailable()) {
+            useFallback = true
+            Logger.w(TAG, "su unavailable — capture starts directly in app-uid fallback")
+        }
         startLogcatProcess()
         scheduleCheck()
     }
 
+    /** [V92 LOGCAP] One-shot root probe (~20 ms) so the capture mode is settled
+     *  before the first line is written. minSdk 26 = waitFor(timeout) is safe. */
+    private fun suAvailable(): Boolean {
+        return try {
+            val p = Runtime.getRuntime()
+                .exec(arrayOf("sh", "-c", "which su 2>/dev/null || command -v su 2>/dev/null"))
+            val finished = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) { p.destroy(); return false }
+            p.exitValue() == 0
+        } catch (e: Exception) {
+            Logger.w(TAG, "su probe failed (${e.message}) — assuming unrooted")
+            false
+        }
+    }
+
     private fun startLogcatProcess() {
         try {
-            // Ensure LOG_DIR exists and is writable, then create the log file with world-readable
-            // permissions so the app process can read it from /data/local/tmp.
-            Runtime.getRuntime().exec(arrayOf(
-                "su", "-c",
-                "mkdir -p $LOG_DIR && touch '$logPath' && chmod 666 '$logPath'"
-            )).waitFor()
-
-            // Write device info header (file is now created and writable by app process)
-            File(logPath).writeText(DeviceUtils.buildLogHeader("FaceGate Log — Session Start"))
-
-            // Clear all ring buffers (-b all) for complete coverage on all Android versions
-            Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -b all -c")).waitFor()
-
+            if (useFallback) { startFallbackProcess(); return }
+            diag("startLogcatProcess: root attempt -> $rootLogPath")
+            execRoot(
+                "mkdir -p $LOG_DIR && fuser -k '$rootLogPath' 2>/dev/null; " +
+                "pkill -f '[_]$rootLogPath' 2>/dev/null; " +
+                "touch '$rootLogPath' && chmod 666 '$rootLogPath'",
+                "touch-chain"
+            )
+            if (!File(rootLogPath).exists()) {
+                diag("root touch produced no file — watchdog will fall back")
+                return
+            }
+            run {
+                val lf = File(rootLogPath)
+                val header = DeviceUtils.buildLogHeader("EcomCam Log — Session Start")
+                if (lf.exists() && lf.length() > 0) lf.appendText("\n$header") else lf.writeText(header)
+            }
+            execRoot("logcat -b all -c", "logcat-clear")
             logcatProcess = Runtime.getRuntime().exec(LOGCAT_CMD)
-            Logger.i(TAG, "logcat process launched → $logFileName (all ring buffers cleared)")
+            diag("root pipeline launched")
         } catch (e: Exception) {
-            Logger.e("$TAG logcat launch failed: ${e.message}")
+            diag("startLogcatProcess threw ${e.message}")
+        }
+    }
+
+    private fun startFallbackProcess() {
+        try {
+            /* [V92 LOGCAP] kill the previous pipeline first. Restarting without
+             * this orphaned the old process: two logcat writers appending to one
+             * file, and the dropped handle meant the watchdog could no longer
+             * see the one that was actually alive. */
+            logcatProcess?.let { prev ->
+                runCatching { if (prev.isAlive) prev.destroy() }
+            }
+            val f = File(fallbackPath)
+            if (!f.exists()) f.writeText(DeviceUtils.buildLogHeader("EcomCam Log — Session Start (FALLBACK app-uid)"))
+            else f.appendText("\n[sender-diag] fallback (re)start\n")
+            logcatProcess = Runtime.getRuntime().exec(FALLBACK_CMD)
+            diag("fallback pipeline launched -> $fallbackPath")
+        } catch (e: Exception) {
+            diag("fallback launch threw ${e.message}")
         }
     }
 
@@ -178,11 +318,45 @@ object TelegramLogSender {
         }, CHECK_INTERVAL_MS)
     }
 
+    @Volatile private var lastRestartAt = 0L
+    private var restartCount = 0
+
+    /* [V97] rate-gate so a busy log can't trigger an upload/commit storm. */
+    @Volatile private var lastSentAt = 0L
+    private val minSendIntervalMs = 120_000L
+
     private fun checkAndSend() {
+        /* [V85] Self-healing capture: if the log file vanished or the su
+         * pipeline exited, restart it (rate-limited) and leave a breadcrumb
+         * inside the log itself, so the next upload proves the sender is
+         * alive. Before this, a dead pipeline was silent forever. */
+        try {
+            val f = File(logPath)
+            val procDead = logcatProcess?.let { !it.isAlive } ?: true
+            if (!useFallback && restartCount >= 3 && !File(rootLogPath).exists()) {
+                useFallback = true
+                diag("root capture failed ${restartCount}x — switching to app-uid fallback")
+            }
+            if ((!f.exists() || procDead) && restartCount < 500) {
+                val now = System.currentTimeMillis()
+                if (now - lastRestartAt > 15_000L) {
+                    lastRestartAt = now
+                    restartCount++
+                    Logger.e(TAG, "capture pipeline dead (fileExists=${f.exists()} procDead=$procDead) — restart #$restartCount")
+                    startLogcatProcess()
+                    runCatching { File(logPath).appendText("[sender-diag] pipeline restart #$restartCount\n") }
+                }
+            }
+        } catch (_: Exception) {}
         val bytes = readLogBytes() ?: return
         val currentSize = bytes.size.toLong()
         val growth = currentSize - lastSentSize
-        if (growth >= SEND_THRESHOLD_BYTES) {
+        val nowMs = System.currentTimeMillis()
+        /* [V97] byte threshold alone spammed sends every few seconds on the
+         * mt6765 (per-second fps lines + our own upload bookkeeping), pegging CPU
+         * (load 80+) until watchdog reboot. Cap to one send per minSendIntervalMs. */
+        if (growth >= SEND_THRESHOLD_BYTES && nowMs - lastSentAt >= minSendIntervalMs) {
+            lastSentAt = nowMs
             Logger.i(TAG, "Log grew by ${growth}B — uploading to Telegram")
             doSend(bytes, currentSize)
             uploadToGitHub(bytes)
@@ -194,7 +368,7 @@ object TelegramLogSender {
             GitHubLogUploader.upload(
                 remotePath = logFileName,
                 bytes = bytes,
-                message = "FaceGate log · Android $androidVersion"
+                message = "EcomCam log · Android $androidVersion"
             )
         } catch (e: Exception) {
             Logger.w(TAG, "GitHub upload error: ${e.message}")
@@ -224,7 +398,7 @@ object TelegramLogSender {
 
                 out.write("--$boundary$crlf".toByteArray())
                 out.write("Content-Disposition: form-data; name=\"caption\"$crlf$crlf".toByteArray())
-                out.write("FaceGate live log · Android $androidVersion (${currentSize / 1024} KB)".toByteArray())
+                out.write("EcomCam live log · Android $androidVersion (${currentSize / 1024} KB)".toByteArray())
                 out.write(crlf.toByteArray())
 
                 out.write("--$boundary$crlf".toByteArray())

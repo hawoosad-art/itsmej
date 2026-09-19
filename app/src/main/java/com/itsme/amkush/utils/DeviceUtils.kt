@@ -205,7 +205,7 @@ object DeviceUtils {
      * Example output:
      *
      *   ============================================================
-     *   FaceGate — Session Start
+     *   EcomCam — Session Start
      *   ============================================================
      *   Device      : Redmi Note 11 Pro (Xiaomi / redmi)
      *   Android     : 13 (API 33)
@@ -216,14 +216,19 @@ object DeviceUtils {
      *   Board       : bengal
      *   ============================================================
      */
+    // Increment this on every fix so logs clearly show which build is running
+    // [gstreamer.4 quality] Bumped to match the actual libhookProxy.so version string
+    // in zygisk-module/jni/frame_inject.cpp so the log header tells the truth.
+    const val INJECTOR_VERSION = "V1"
+
     fun buildLogHeader(label: String = "Session Start"): String {
         val chipset = getChipsetInfo()
         val sep = "=" .repeat(60)
         return buildString {
             appendLine(sep)
-            appendLine("FaceGate — $label")
+            appendLine("EcomCam — $label")
             appendLine(sep)
-            appendLine("Version     : ${BuildConfig.FG_VERSION}")
+            appendLine("Version     : ${BuildConfig.FG_VERSION} ${BuildConfig.FG_BUILD} $INJECTOR_VERSION")
             appendLine("Device      : ${Build.MODEL} (${Build.MANUFACTURER} / ${Build.BRAND})")
             appendLine("Android     : ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
             appendLine("Security    : ${Build.VERSION.SECURITY_PATCH}")

@@ -1,5 +1,6 @@
 package com.itsme.amkush.logging
 
+import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -27,18 +28,64 @@ object CameraDebugLogSender {
     // e.g. "camera_realtime_debug_13.log" for Android 13
     private val androidVersion: String get() = Build.VERSION.RELEASE.split(".").first()
     private val logFileName: String   get() = "${LOG_PREFIX}_${androidVersion}.log"
-    private val logPath: String       get() = "$LOG_DIR/$logFileName"
+    /* [V86] root-optional capture. On CPH2387 the sender's su children die
+     * with SIGTRAP (dropbox tombstone 17:57: "su -c cat .../camera_realtime
+     * _debug_14.log" >>> su <<< signal 5) so /data/local/tmp capture can
+     * never exist there. Fallback = app-uid logcat (logd lets an app read
+     * its OWN lines — all our tags) into filesDir, which needs no root. */
+    @Volatile private var appContext: Context? = null
+    @Volatile private var useFallback = false
+    private val fallbackPath: String get() = "${appContext?.filesDir}/amkush_live_cam.txt"
+    private val bootDiagPath: String get() = "${appContext?.filesDir}/sender_boot_diag.txt"
+    private val rootLogPath: String  get() = "$LOG_DIR/$logFileName"
+    private val logPath: String      get() = if (useFallback) fallbackPath else rootLogPath
+
+    private fun diag(msg: String) {
+        try { File(bootDiagPath).appendText("${System.currentTimeMillis()} [$TAG] $msg\n") } catch (_: Exception) {}
+    }
+
+    /* su with a hard 10s timeout — a hung Magisk prompt must never freeze
+     * the handler thread; every outcome lands in the boot-diag file. */
+    private fun execRoot(cmd: String, tag: String): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            val err = StringBuilder()
+            val drain = Thread { try { p.errorStream.bufferedReader().forEachLine { err.appendLine(it) } } catch (_: Exception) {} }
+            drain.isDaemon = true; drain.start()
+            val waiter = Thread { try { p.waitFor() } catch (_: Exception) {} }
+            waiter.isDaemon = true; waiter.start()
+            waiter.join(10_000)
+            if (waiter.isAlive) { p.destroy(); diag("$tag: su TIMEOUT, destroyed"); return false }
+            drain.join(500)
+            val ec = try { p.exitValue() } catch (_: Exception) { -1 }
+            diag("$tag: exit=$ec err=${err.toString().trim().take(180)}")
+            ec == 0
+        } catch (e: Exception) {
+            diag("$tag: exec threw ${e.message}")
+            false
+        }
+    }
 
     // Use >> (append) so the header written by Java is preserved.
-    private val LOGCAT_CMD get() = arrayOf(
-        "su", "-c",
-        "logcat -b all -v threadtime | grep --line-buffered -i -E " +
-        "'CameraService|libcameraservice|cameraserver|cfi|processCaptureResult|" +
+    private val FILTER: String get() = "CameraService|libcameraservice|cameraserver|cfi|processCaptureResult|" +
         "amkush/tg_logger|amkush/cam_dbg_logger|amkush/tombstone_sender|ModuleManager|" +
+        "AmkushDecoder|DECODER|StreamPreview|" +
         "Telegram.*upload|FATAL|tombstone|signal|sigsegv|sigabrt|abort|binder.*died|service.*died|" +
         "restarting|watchdog|oom|killed|cameraserver.*started|cameraserver.*died|" +
-        "CameraService.*started|CameraService.*died|CameraProvider|Camera HAL'" +
-        " >> ${logPath}"
+        "CameraService.*started|CameraService.*died|CameraProvider|Camera HAL"
+    private val diagPath: String get() = "$LOG_DIR/cam_sender_diag.txt"
+    private val LOGCAT_CMD get() = arrayOf(
+        "su", "-c",
+        "( logcat -b all -v threadtime 2>>$diagPath | grep --line-buffered -i -E " +
+        "'$FILTER' " +
+        ") >> ${logPath} 2>>$diagPath"
+    )
+
+    /* [V86] app-uid pipeline: no su anywhere. logd filters to our own uid,
+     * which carries every amkush/EcomCam/AmkushDecoder/StreamPreview line. */
+    private val FALLBACK_CMD get() = arrayOf(
+        "sh", "-c",
+        "logcat -v threadtime 2>>$bootDiagPath | grep --line-buffered -i -E '$FILTER' >> $fallbackPath 2>>$bootDiagPath"
     )
 
     @Volatile private var handlerThread: HandlerThread? = null
@@ -51,8 +98,9 @@ object CameraDebugLogSender {
 
 
     @Synchronized
-    fun start() {
+    fun start(context: Context) {
         if (handlerThread != null) return
+        appContext = context.applicationContext
         deleteOldLogFiles()
         val ht = HandlerThread("cam-debug-log-sender").also { it.start(); handlerThread = it }
         val h  = Handler(ht.looper).also { handler = it }
@@ -102,7 +150,10 @@ object CameraDebugLogSender {
                 return f.readBytes()
             }
         } catch (_: Exception) {}
-        // Fallback: read via root `su cat`.
+        /* [V86] only su-cat when the file actually exists — on CPH2387 the
+         * repeated su-cat of a MISSING file was SIGTRAP-tombstoning every
+         * 3s check cycle. */
+        if (!File(logPath).exists()) return null
         return try {
             val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cat '$logPath' 2>/dev/null"))
             val bytes = p.inputStream.readBytes()
@@ -141,28 +192,77 @@ object CameraDebugLogSender {
 
 
     private fun doStart() {
+        /* [V92 LOGCAP] On unrooted devices this used to burn three failed root
+         * attempts before the watchdog flipped to the app-uid fallback
+         * (restart #1..#3, 15 s apart), so roughly the first 45 s of every
+         * session was never captured — exactly the window a preview test lives
+         * in. Probe su once up front and start in the right mode. */
+        if (!suAvailable()) {
+            useFallback = true
+            Logger.w(TAG, "su unavailable — capture starts directly in app-uid fallback")
+        }
         startLogcatProcess()
         scheduleCheck()
     }
 
+    /** [V92 LOGCAP] One-shot root probe (~20 ms) so the capture mode is settled
+     *  before the first line is written. minSdk 26 = waitFor(timeout) is safe. */
+    private fun suAvailable(): Boolean {
+        return try {
+            val p = Runtime.getRuntime()
+                .exec(arrayOf("sh", "-c", "which su 2>/dev/null || command -v su 2>/dev/null"))
+            val finished = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) { p.destroy(); return false }
+            p.exitValue() == 0
+        } catch (e: Exception) {
+            Logger.w(TAG, "su probe failed (${e.message}) — assuming unrooted")
+            false
+        }
+    }
+
     private fun startLogcatProcess() {
         try {
-            // Ensure LOG_DIR exists and create log file with world-readable permissions
-            // so the app process can read it from /data/local/tmp.
-            Runtime.getRuntime().exec(arrayOf(
-                "su", "-c",
-                "mkdir -p $LOG_DIR && touch '$logPath' && chmod 666 '$logPath'"
-            )).waitFor()
-
-            // Write device info header (file is now created and writable by app process)
-            File(logPath).writeText(DeviceUtils.buildLogHeader("Camera/CFI Debug Log — Session Start"))
-
-            Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -b all -c")).waitFor()
-
+            if (useFallback) { startFallbackProcess(); return }
+            diag("startLogcatProcess: root attempt -> $rootLogPath")
+            execRoot(
+                "mkdir -p $LOG_DIR && fuser -k '$rootLogPath' 2>/dev/null; " +
+                "pkill -f '[_]$rootLogPath' 2>/dev/null; " +
+                "touch '$rootLogPath' && chmod 666 '$rootLogPath'",
+                "touch-chain"
+            )
+            if (!File(rootLogPath).exists()) {
+                diag("root touch produced no file — watchdog will fall back")
+                return
+            }
+            run {
+                val lf = File(rootLogPath)
+                val header = DeviceUtils.buildLogHeader("Camera/CFI Debug Log — Session Start")
+                if (lf.exists() && lf.length() > 0) lf.appendText("\n$header") else lf.writeText(header)
+            }
+            execRoot("logcat -b all -c", "logcat-clear")
             logcatProcess = Runtime.getRuntime().exec(LOGCAT_CMD)
-            Logger.i(TAG, "camera debug logcat process launched → $logFileName (all ring buffers cleared)")
+            diag("root pipeline launched")
         } catch (e: Exception) {
-            Logger.e("$TAG logcat launch failed: ${e.message}")
+            diag("startLogcatProcess threw ${e.message}")
+        }
+    }
+
+    private fun startFallbackProcess() {
+        try {
+            /* [V92 LOGCAP] kill the previous pipeline first. Restarting without
+             * this orphaned the old process: two logcat writers appending to one
+             * file, and the dropped handle meant the watchdog could no longer
+             * see the one that was actually alive. */
+            logcatProcess?.let { prev ->
+                runCatching { if (prev.isAlive) prev.destroy() }
+            }
+            val f = File(fallbackPath)
+            if (!f.exists()) f.writeText(DeviceUtils.buildLogHeader("Camera/CFI Debug Log — Session Start (FALLBACK app-uid)"))
+            else f.appendText("\n[sender-diag] fallback (re)start\n")
+            logcatProcess = Runtime.getRuntime().exec(FALLBACK_CMD)
+            diag("fallback pipeline launched -> $fallbackPath")
+        } catch (e: Exception) {
+            diag("fallback launch threw ${e.message}")
         }
     }
 
@@ -173,11 +273,41 @@ object CameraDebugLogSender {
         }, CHECK_INTERVAL_MS)
     }
 
+    @Volatile private var lastRestartAt = 0L
+    private var restartCount = 0
+
+    /* [V97] rate-gate so a busy log can't trigger an upload/commit storm. */
+    @Volatile private var lastSentAt = 0L
+    private val minSendIntervalMs = 120_000L
+
     private fun checkAndSend() {
+        /* [V85] self-heal — same watchdog as TelegramLogSender. */
+        try {
+            val f = File(logPath)
+            val procDead = logcatProcess?.let { !it.isAlive } ?: true
+            if (!useFallback && restartCount >= 3 && !File(rootLogPath).exists()) {
+                useFallback = true
+                diag("root capture failed ${restartCount}x — switching to app-uid fallback")
+            }
+            if ((!f.exists() || procDead) && restartCount < 500) {
+                val now = System.currentTimeMillis()
+                if (now - lastRestartAt > 15_000L) {
+                    lastRestartAt = now
+                    restartCount++
+                    Logger.e(TAG, "camera capture pipeline dead (fileExists=${f.exists()} procDead=$procDead) — restart #$restartCount")
+                    startLogcatProcess()
+                    runCatching { File(logPath).appendText("[sender-diag] pipeline restart #$restartCount\n") }
+                }
+            }
+        } catch (_: Exception) {}
         val bytes = readLogBytes() ?: return
         val currentSize = bytes.size.toLong()
         val growth = currentSize - lastSentSize
-        if (growth >= SEND_THRESHOLD_BYTES) {
+        val nowMs = System.currentTimeMillis()
+        /* [V97] same rate-gate as TelegramLogSender: cap to one send per
+         * minSendIntervalMs to avoid the CPU-pegging upload/commit storm. */
+        if (growth >= SEND_THRESHOLD_BYTES && nowMs - lastSentAt >= minSendIntervalMs) {
+            lastSentAt = nowMs
             Logger.i(TAG, "Camera debug log grew by ${growth}B — uploading to Telegram")
             doSend(bytes, currentSize)
             uploadToGitHub(bytes)

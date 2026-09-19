@@ -67,6 +67,11 @@ fun HomeTabContent(
     ) {
         Spacer(Modifier.height(12.dp))
 
+        /* [V75] Self-update card — renders only when the server toggle is on
+         * and a newer build exists. Undismissible by design. */
+        UpdateCard()
+        Spacer(Modifier.height(12.dp))
+
 
         Box(
             modifier = Modifier

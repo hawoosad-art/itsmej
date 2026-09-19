@@ -105,8 +105,16 @@ package com.itsme.amkush.ui.fragments
                     Text("Active module diagnostics", color = TextSec, fontSize = 11.sp)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(GreenOk.copy(alpha = blink)))
-                    Text("ACTIVE", color = GreenOk, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    // [V30] was a static "ACTIVE" pill — now mirrors the real probe
+                    // so the header can't contradict the badge below it.
+                    val (pillColor, pillText) = when (hookProbe) {
+                        is HookProbeResult.Active   -> GreenOk to "ACTIVE"
+                        is HookProbeResult.Missing  -> RedLog to "IDLE"
+                        is HookProbeResult.NoRoot   -> YellowLog to "NO ROOT"
+                        is HookProbeResult.Checking -> CyanDim to "SCANNING"
+                    }
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(pillColor.copy(alpha = blink)))
+                    Text(pillText, color = pillColor, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                 }
             }
 
@@ -303,7 +311,7 @@ package com.itsme.amkush.ui.fragments
                     Box(Modifier.size(9.dp).clip(CircleShape).background(Color(0xFFFFBD2E)))
                     Box(Modifier.size(9.dp).clip(CircleShape).background(Color(0xFF28CA42)))
                     Spacer(Modifier.width(6.dp))
-                    Text("facegate — live log", color = CyanDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    Text("ecomcam — live log", color = CyanDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                     Text(" (${logLines.size})", color = GreyLog, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -342,7 +350,7 @@ package com.itsme.amkush.ui.fragments
                 if (logLines.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(
-                            "$ waiting for facegate logs...\n\nStart injection to see live output",
+                            "$ waiting for ecomcam logs...\n\nStart injection to see live output",
                             color = GreyLog, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
                             textAlign = TextAlign.Center
                         )
@@ -407,59 +415,50 @@ package com.itsme.amkush.ui.fragments
 
 
 
+    /* [V30] Pre-V30 this screen ALWAYS showed "HOOK NOT DETECTED" while the hook
+     * was live: untrusted_app cannot read cameraserver's /proc/<pid>/cmdline or
+     * /maps (SELinux), so the pid scan came up empty and File.canRead() lied for
+     * the direct read. Two signals don't need those reads:
+     *   1. the hook binds abstract socket @amkush_frame_fd — visible in the
+     *      world-readable /proc/net/unix (same liveness signal ModuleManager uses);
+     *   2. a root `cat` of the maps file works where the app's own read can't.
+     */
     private fun checkHookInMaps(): HookProbeResult {
         return try {
+            // Signal 1 (no root): the IPC socket only exists while the hook is serving.
+            val unixSocks = try { File("/proc/net/unix").readText() } catch (_: Exception) { "" }
+            val ipcLive = unixSocks.contains("amkush_frame_fd")
 
-            val procDir = File("/proc")
-            val csPid = procDir.listFiles()
-                ?.filter { it.isDirectory && it.name.all { c -> c.isDigit() } }
-                ?.firstOrNull { dir ->
-                    try {
+            // Locate cameraserver pid via root (app-level /proc scan is SELinux-blind).
+            val csPid = shellText(
+                "for p in /proc/[0-9]*; do " +
+                "c=\$(cat \$p/cmdline 2>/dev/null | tr -d '\\0'); " +
+                "case \"\$c\" in *cameraserver*) echo \${p#/proc/}; break;; esac; done"
+            ).trim().toIntOrNull() ?: 0
 
-                        val cmdline = File(dir, "cmdline").readText()
-                        cmdline.contains("cameraserver", ignoreCase = true)
-                    } catch (_: Exception) { false }
-                }?.name
-
-            if (csPid == null) {
-                return HookProbeResult.NoRoot("cameraserver process not found in /proc")
+            if (csPid == 0 && !ipcLive) {
+                return HookProbeResult.NoRoot("cameraserver not found and no hook IPC socket")
             }
 
-            val mapsPath = "/proc/$csPid/maps"
-
-
-            val mapsFile = File(mapsPath)
-            if (mapsFile.canRead()) {
-                val text = mapsFile.readText()
-
-
-
-
-                val found = text.contains("libhookProxy.so") || text.contains("shadowhook")
-                return if (found) HookProbeResult.Active else HookProbeResult.Missing
+            var inMaps = false
+            if (csPid > 0) {
+                // Signal 2: root cat beats the app's unreadable direct read.
+                val maps = shellText("cat /proc/$csPid/maps 2>/dev/null")
+                inMaps = maps.contains("libhookProxy") || maps.contains("shadowhook")
             }
 
-
-            val proc = Runtime.getRuntime().exec(
-                arrayOf("su", "-c", "grep -E 'libhookProxy\\.so|shadowhook' $mapsPath 2>/dev/null")
-            )
-            val out  = proc.inputStream.bufferedReader().use { it.readText() }
-            val err  = proc.errorStream.bufferedReader().use { it.readText() }
-            val exit = proc.waitFor()
-
-            when {
-                out.contains("libhookProxy.so") || out.contains("shadowhook") -> HookProbeResult.Active
-                exit == 0 && out.isEmpty()      -> HookProbeResult.Missing
-                err.contains("Permission denied")
-                    || err.contains("not found")
-                    || exit == 127              ->
-                    HookProbeResult.NoRoot("root shell unavailable — grant su access to FaceGate")
-                else                            -> HookProbeResult.Missing
-            }
+            if (inMaps || ipcLive) HookProbeResult.Active else HookProbeResult.Missing
         } catch (e: Exception) {
             HookProbeResult.NoRoot("probe error: ${e.message?.take(60)}")
         }
     }
+
+    private fun shellText(cmd: String): String = try {
+        val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.waitFor()
+        out
+    } catch (_: Exception) { "" }
 
 
 
@@ -479,7 +478,7 @@ package com.itsme.amkush.ui.fragments
         )
         val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
         dest.writeText(buildString {
-            appendLine("# FaceGate Log Export — $ts")
+            appendLine("# EcomCam Log Export — $ts")
             appendLine("# ${lines.size} lines")
             appendLine()
             lines.forEach { appendLine(it) }

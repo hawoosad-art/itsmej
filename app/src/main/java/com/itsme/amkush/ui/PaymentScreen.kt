@@ -56,29 +56,14 @@ class PaymentScreen : ComponentActivity() {
         val targetAppName = intent.getStringExtra("target_app_name")
         SharedPrefs.init(this)
 
-        // Re-verify against the server before trusting the local activation, so a
-        // key deleted on the admin panel deactivates immediately instead of the
-        // local fg_lic.bin keeping the app "active" forever. Falls back to the
-        // local check only when offline.
-        val token = SharedPrefs.getActivationToken()
-        if (!token.isNullOrEmpty()) {
-            CoroutineScope(Dispatchers.IO).launch {
-                val deviceId = DeviceUtils.getDeviceId(this@PaymentScreen)
-                val result = LicenseGuard.verifyToken(token, deviceId)
-                runOnUiThread {
-                    if (result.valid) {
-                        val expiryMs = HomeViewModel.parseExpiryMs(result.expiresAt)
-                        LicenseGuard.nativeSaveActivation(this@PaymentScreen, token, result.isTrial, expiryMs)
-                        proceedToDashboard(targetPackage, targetAppName)
-                    } else {
-                        SharedPrefs.clearActivation()
-                        LicenseGuard.nativeClearActivation(this@PaymentScreen)
-                        showPayment(targetPackage, targetAppName)
-                    }
-                }
+        // Activation is checked entirely from the encrypted local activation file.
+        CoroutineScope(Dispatchers.IO).launch {
+            val active = runCatching { LicenseGuard.nativeIsActivated(this@PaymentScreen) }
+                .getOrDefault(false)
+            runOnUiThread {
+                if (active) proceedToDashboard(targetPackage, targetAppName)
+                else showPayment(targetPackage, targetAppName)
             }
-        } else {
-            showPayment(targetPackage, targetAppName)
         }
     }
 
@@ -168,8 +153,7 @@ private fun PaymentContent(
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val rawDeviceId = DeviceUtils.getDeviceId(context)
-                val wifiIp = DeviceUtils.getWifiIpAddress(context)
-                val result = LicenseGuard.validateKey(key.trim(), rawDeviceId, wifiIp)
+                val result = LicenseGuard.validateKey(key.trim(), rawDeviceId)
 
                 withContext(Dispatchers.Main) {
                     loading = false
@@ -179,7 +163,6 @@ private fun PaymentContent(
                         SharedPrefs.setPaid(!result.isTrial)
                         val expiryMs = HomeViewModel.parseExpiryMs(result.expiresAt)
                         if (result.isTrial) {
-                            SharedPrefs.setTrialWifiIp(wifiIp)
                             if (expiryMs > 0) SharedPrefs.setTrialExpiry(expiryMs)
                         }
                         LicenseGuard.nativeSaveActivation(context, result.token, result.isTrial, expiryMs)
@@ -197,7 +180,7 @@ private fun PaymentContent(
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     loading = false
-                    errorMsg = "Network error: ${e.message}"
+                    errorMsg = "Activation error: ${e.message}"
                 }
             }
         }

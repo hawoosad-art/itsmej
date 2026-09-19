@@ -6,16 +6,12 @@
 -keepclasseswithmembernames class com.itsme.amkush.security.LicenseGuard {
     native <methods>;
 }
--keepclasseswithmembernames class com.itsme.amkush.license.LicenseClient {
-    native <methods>;
-}
 -keep class com.itsme.amkush.security.LicenseGuard { *; }
--keep class com.itsme.amkush.license.LicenseClient { *; }
 -keep class com.itsme.amkush.manager.ModuleManager { *; }
 
 # Keep all hook classes
 -keep class com.itsme.amkush.hooks.** { *; }
--keep class com.itsme.amkush.ffmpeg.** { *; }
+-keep class com.itsme.amkush.gstreamer.** { *; }
 -keep class com.itsme.amkush.libyuv.** { *; }
 -keep class com.itsme.amkush.router.** { *; }
 
@@ -24,19 +20,14 @@
 -keep class android.hardware.Camera { *; }
 -keep class androidx.camera.core.** { *; }
 
-# Keep FFmpeg JNI callback interface (native code calls these by name)
--keep interface com.itsme.amkush.ffmpeg.FFmpegDecoder$FrameCallback { *; }
--keepclasseswithmembernames class com.itsme.amkush.ffmpeg.FFmpegDecoder {
+# Keep GStreamer JNI callback interface (native code calls these by name)
+-keep interface com.itsme.amkush.gstreamer.GStreamerDecoder$FrameCallback { *; }
+-keepclasseswithmembernames class com.itsme.amkush.gstreamer.GStreamerDecoder {
     native <methods>;
 }
 -keepclasseswithmembernames class com.itsme.amkush.libyuv.LibYuv {
     native <methods>;
 }
-
-# Keep Retrofit/Gson
--keep class com.squareup.okhttp3.** { *; }
--keep class com.google.gson.** { *; }
--keep class com.itsme.amkush.network.models.** { *; }
 
 # Keep ViewModels
 -keep class com.itsme.amkush.ui.** { *; }
@@ -71,7 +62,4 @@
     public static *** d(...);
     public static *** v(...);
 }
-  # Keep FFmpegKit and smart-exception (used internally by ffmpeg-kit-*.aar; R8 strips them without this)
-  -keep class com.arthenica.smartexception.** { *; }
-  -keep class com.arthenica.ffmpegkit.** { *; }
   

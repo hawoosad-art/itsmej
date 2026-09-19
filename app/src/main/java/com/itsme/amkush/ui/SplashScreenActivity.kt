@@ -1,6 +1,8 @@
 package com.itsme.amkush.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -9,6 +11,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -46,13 +49,13 @@ private val Green    = Color(0xFFA8FF78)
 private data class LogEntry(val tag: String, val text: String, val tagColor: Color)
 
 private val LOGS = listOf(
-    LogEntry("BOOT",   "FaceGate starting up...",              Violet),
+    LogEntry("BOOT",   "EcomCam starting up...",              Violet),
     LogEntry("CORE",   "Core engine loaded",                   Cyan),
     LogEntry("FACE",   "Face recognition module ready",        Pink),
     LogEntry("STREAM", "Decoder initialized..",                Amber),
     LogEntry("GATE",   "Access control layer initialized",     Green),
     LogEntry("UI",     "Interface ready · loading dashboard",  Cyan),
-    LogEntry("READY",  "FaceGate is online · happy hooking",   Violet),
+    LogEntry("READY",  "EcomCam is online · happy hooking",   Violet),
 )
 
 private const val GLITCH_CHARS = "!@#\$%^&*<>?/\\|{}[]~`"
@@ -70,9 +73,26 @@ class SplashScreenActivity : ComponentActivity() {
         proceedToNextScreen()
     }
 
+    /* [V80] POST_NOTIFICATIONS is declared in the manifest but was never
+     * requested at runtime, so on Android 13+ it stayed denied and every
+     * startForeground() notification was silently dropped by the system. The
+     * overlay foreground service therefore ran with NO visible notification —
+     * the owner had never seen the Hide/Show controls the channel promises.
+     * Fire-and-forget: we proceed regardless of the answer. */
+    private val notifPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or not, the overlay service still works either way */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SharedPrefs.init(this)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         setContent {
             SplashContent(
@@ -191,7 +211,7 @@ private fun SplashContent(onFinished: () -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    "FACEGATE",
+                    "ECOMCAM",
                     color = Cyan,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
@@ -232,7 +252,7 @@ private fun SplashContent(onFinished: () -> Unit) {
                         WaveBars(color = Pink, heights = listOf(0.85f, 0.5f, 0.9f, 1f, 0.6f, 0.75f, 0.4f))
                         Image(
                             painter = painterResource(id = R.drawable.splash_hacker),
-                            contentDescription = "FaceGate",
+                            contentDescription = "EcomCam",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
                                 .size(72.dp)
@@ -262,7 +282,7 @@ private fun SplashContent(onFinished: () -> Unit) {
                     Dot(Color(0xFFFEBC2E))
                     Dot(Color(0xFF28C840))
                     Text(
-                        "@facegate — terminal",
+                        "@ecomcam — terminal",
                         color = Color.White.copy(alpha = 0.18f),
                         fontSize = 11.sp,
                         letterSpacing = 1.sp,
@@ -312,7 +332,7 @@ private fun SplashContent(onFinished: () -> Unit) {
 
                     if (lines.isEmpty()) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text("@facegate", color = Violet, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("@ecomcam", color = Violet, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                             Text("›", color = Color.White.copy(alpha = 0.12f), fontFamily = FontFamily.Monospace)
                             Text("▋", color = Violet.copy(alpha = if (cursor) 1f else 0f), fontFamily = FontFamily.Monospace)
                         }
@@ -361,7 +381,7 @@ private fun WaveBars(color: Color, heights: List<Float>) {
 private fun LogLineRow(line: LiveLine, cursorOn: Boolean, ready: Boolean) {
     Row(modifier = Modifier.padding(bottom = 9.dp), verticalAlignment = Alignment.Top) {
         Text(
-            "@facegate",
+            "@ecomcam",
             color = Violet,
             fontSize = 12.5.sp,
             fontWeight = FontWeight.Bold,
@@ -420,7 +440,7 @@ private fun LogLineRow(line: LiveLine, cursorOn: Boolean, ready: Boolean) {
 private fun LogRow(tagColor: Color, tag: String, text: String, showBadge: Boolean, alpha: Float) {
     Row(modifier = Modifier.padding(bottom = 9.dp).background(Color.Transparent), verticalAlignment = Alignment.Top) {
         Text(
-            "@facegate",
+            "@ecomcam",
             color = Violet.copy(alpha = alpha),
             fontSize = 12.5.sp,
             fontWeight = FontWeight.Bold,

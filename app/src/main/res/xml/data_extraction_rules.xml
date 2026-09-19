@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  [V91] Belt-and-braces backup exclusion (API 31+).
+
+  allowBackup="false" already disables Auto Backup / D2D transfer, but the
+  rules file makes the intent explicit and survives someone flipping the
+  manifest flag back on: nothing in this app may ever be snapshotted to
+  Google cloud backup or copied by device-to-device transfer.
+
+  Reason: files/fg_lic.bin holds the encrypted activation token and
+  shared_prefs holds the paid/trial flags. When they were backed up,
+  uninstalling and reinstalling the production app restored a fully
+  activated state with no key entered — the payment gate was bypassed.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

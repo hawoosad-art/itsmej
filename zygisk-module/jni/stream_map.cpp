@@ -120,6 +120,16 @@ static StreamRole classify_stream(const camera3_stream_t *s) {
         return (w <= 64) ? STREAM_ROLE_YUV_ANALYSIS : STREAM_ROLE_PREVIEW;
     }
 
+    /* [V96 NV21] YCrCb_420_SP / NV21 (0x11). The MediaTek HAL on the TECNO CE9
+     * (log11) hands the app an NV21 stream alongside the YUV_420_888 one; with
+     * no case here those buffers classified UNKNOWN and were skipped — that is
+     * exactly the skip_role=553 / frames_inject_fail=553 in the log — even
+     * though frame_inject_one() already writes 0x11 buffers (its switch lists
+     * HAL_PIXEL_FORMAT_YCrCb_420_SP). Classify them as injectable. */
+    if (fmt == HAL_PIXEL_FORMAT_YCrCb_420_SP) {
+        return (w <= 64) ? STREAM_ROLE_YUV_ANALYSIS : STREAM_ROLE_PREVIEW;
+    }
+
     if (fmt == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
 
         if (usage == 0 && s->data_space != 0) {

@@ -4,7 +4,7 @@ import android.graphics.ImageFormat
 import android.media.Image
 import android.media.ImageWriter
 import android.view.Surface
-import com.itsme.amkush.ffmpeg.FFmpegDecoder
+import com.itsme.amkush.media.AmkushDecoder
 import com.itsme.amkush.libyuv.LibYuv
 import com.itsme.amkush.utils.Logger
 import java.nio.ByteBuffer
@@ -13,7 +13,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-object SurfaceRouter : FFmpegDecoder.FrameCallback {
+object SurfaceRouter : AmkushDecoder.FrameCallback {
 
     private const val TAG = "SurfaceRouter"
 

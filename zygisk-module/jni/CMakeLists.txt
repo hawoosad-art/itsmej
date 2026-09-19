@@ -52,6 +52,58 @@ if(DEFINED HOOK_PROXY_VERSION AND NOT HOOK_PROXY_VERSION STREQUAL "")
         HOOK_PROXY_VERSION="${HOOK_PROXY_VERSION}")
 endif()
 
+# FRAME_BUILD_ID — the same git-derived branch-sha marker forwarded to
+# frame_inject.cpp so every chroma/injection log line carries the exact build.
+# The CI workflow passes it directly (-DFRAME_BUILD_ID="<branch>-<sha>");
+# fall back to HOOK_PROXY_VERSION, then to a placeholder.
+if(DEFINED FRAME_BUILD_ID AND NOT FRAME_BUILD_ID STREQUAL "")
+    target_compile_definitions(hookProxy PRIVATE
+        FRAME_BUILD_ID="${FRAME_BUILD_ID}")
+elseif(DEFINED HOOK_PROXY_VERSION AND NOT HOOK_PROXY_VERSION STREQUAL "")
+    target_compile_definitions(hookProxy PRIVATE
+        FRAME_BUILD_ID="${HOOK_PROXY_VERSION}")
+else()
+    target_compile_definitions(hookProxy PRIVATE FRAME_BUILD_ID="dev-unknown")
+endif()
+
+# ── UNISOC 0x22 (IMPLEMENTATION_DEFINED) chroma A/B switch ────────────────────
+# The fresh-build logs show the *same* 0x22 payload written as NV12 is correct on
+# one stream (role=2 VIDEO) and blue on another (role=1 PREVIEW), and it was blue
+# as BOTH NV21 and NV12 on different builds. A single hard-coded flag therefore
+# cannot be trusted to fix the preview for every device. This is the A/B knob the
+# CI passes at build time:
+#     -DUNISOC_22_CHROMA=nv12  (default; matches gstreamer.3 behavior)
+#     -DUNISOC_22_CHROMA=nv21  (force U/V swap for the 0x22 opaque buffer)
+# It also becomes a runtime override target (frame_inject_set_chroma_override)
+# so ONE APK can test both orders. If not provided, defaults to nv12.
+if(DEFINED UNISOC_22_CHROMA AND NOT UNISOC_22_CHROMA STREQUAL "")
+    if(UNISOC_22_CHROMA STREQUAL "nv21")
+        target_compile_definitions(hookProxy PRIVATE UNISOC_22_IS_NV21=1)
+    else()
+        target_compile_definitions(hookProxy PRIVATE UNISOC_22_IS_NV21=0)
+    endif()
+else()
+    target_compile_definitions(hookProxy PRIVATE UNISOC_22_IS_NV21=0)
+endif()
+# Always expose the build-time value so the log can show it and the runtime
+# override can compare against it.
+target_compile_definitions(hookProxy PRIVATE UNISOC_22_DEFAULT_IS_NV21=UNISOC_22_IS_NV21)
+
+# ── UNISOC 0x23 (YCbCr420-888) chroma switch ─────────────────────────────────
+# The SAME 0x23 stream is consumed NV21 on UNISOC/TECNO but NV12 on MediaTek/OPPO.
+# Default to nv12 so the MediaTek camera-app preview is no longer blue; UNISOC
+# builds pass -DUNISOC_23_CHROMA=nv21. Runtime A/B still available via the app.
+if(DEFINED UNISOC_23_CHROMA AND NOT UNISOC_23_CHROMA STREQUAL "")
+    if(UNISOC_23_CHROMA STREQUAL "nv21")
+        target_compile_definitions(hookProxy PRIVATE UNISOC_23_IS_NV21=1)
+    else()
+        target_compile_definitions(hookProxy PRIVATE UNISOC_23_IS_NV21=0)
+    endif()
+else()
+    target_compile_definitions(hookProxy PRIVATE UNISOC_23_IS_NV21=0)
+endif()
+target_compile_definitions(hookProxy PRIVATE UNISOC_23_DEFAULT_IS_NV21=UNISOC_23_IS_NV21)
+
 # ── System libraries ────────────────────────────────────────────────────────
 find_library(LOG_LIB     log)
 find_library(ANDROID_LIB android)
@@ -133,3 +185,8 @@ endif()
 
 set_target_properties(hookProxy PROPERTIES OUTPUT_NAME "hookProxy")
 message(STATUS "hookProxy configured — ABI=${ANDROID_ABI} (Zygisk: REMOVED, ShadowHook: STATIC, C++STL: STATIC)")
+
+# [V53] native root-hide engine — pure-syscall cloak binary shipped as an asset
+add_executable(amkush_cloak cloak_main.cpp)
+target_compile_options(amkush_cloak PRIVATE -fPIE)
+target_link_options(amkush_cloak PRIVATE -static-libstdc++ -pie)

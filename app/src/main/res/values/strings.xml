@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- App Name -->
-    <string name="app_name">FaceGate</string>
+    <string name="app_name">EcomCam</string>
 
     <!-- ===== PAYMENT SCREEN ===== -->
     <string name="activate_key">ACTIVATE KEY</string>
@@ -9,7 +9,7 @@
     <string name="target_locked">TARGET LOCKED</string>
     <string name="device_id">DEVICE ID</string>
     <string name="tap_to_copy">TAP TO COPY</string>
-    <string name="facegate_bot">FACEGATE BOT</string>
+    <string name="facegate_bot">ECOMCAM BOT</string>
     <string name="buy_key_from_bot">Buy key from bot</string>
     <string name="visit_bot">1. Visit bot</string>
     <string name="view_pricing">2. View pricing</string>
@@ -19,7 +19,7 @@
     <string name="activate_key_button">ACTIVATE KEY</string>
 
     <!-- ===== HOME SCREEN ===== -->
-    <string name="home_title">FaceGate</string>
+    <string name="home_title">EcomCam</string>
     <string name="select_target_app">Select target app</string>
     <string name="lock_target">LOCK TARGET</string>
     <string name="search_apps">Search apps...</string>
@@ -92,27 +92,6 @@
     <string name="uptime_minutes">%dm</string>
     <string name="frame_count">Frames</string>
     <string name="decoder_type">Decoder</string>
-
-    <!-- ===== SETTINGS / DEVICE SPOOF ===== -->
-    <string name="device_spoofing_title">Device Spoofing</string>
-    <string name="device_spoofing_subtitle">Spoof device info for target app</string>
-    <string name="current_device_info">Current Device Info</string>
-    <string name="model">Model</string>
-    <string name="brand">Brand</string>
-    <string name="manufacturer">Manufacturer</string>
-    <string name="android_version">Android</string>
-    <string name="build_id">Build ID</string>
-    <string name="security_patch">Security Patch</string>
-    <string name="apply_spoof">Apply Spoof</string>
-    <string name="reset">Reset</string>
-    <string name="spoof_active">✅ Spoof active</string>
-    <string name="spoof_inactive">⏳ Spoof inactive</string>
-    <string name="enter_at_least_one">Please enter at least one spoof value</string>
-    <string name="device_id_hint">Device ID e.g. 4743-4E9A-E9D7-B22A</string>
-    <string name="serial_hint">Serial Number</string>
-    <string name="spoof_applied">Device spoof applied!</string>
-    <string name="spoof_reset">Spoof reset to device defaults</string>
-    <string name="spoof_note">Note: Spoofing only applies to the target app</string>
 
     <!-- ===== DENY LIST ===== -->
     <string name="deny_list_title">Deny List</string>

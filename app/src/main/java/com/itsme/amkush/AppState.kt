@@ -8,7 +8,7 @@ object AppState {
     @Volatile var context: Context? = null
     @Volatile var isPlaying: Boolean = false
     @Volatile var targetPackage: String? = null
-    const val TAG = "FaceGate"
+    const val TAG = "EcomCam"
 
     data class VideoFrame(
         val data: ByteArray,

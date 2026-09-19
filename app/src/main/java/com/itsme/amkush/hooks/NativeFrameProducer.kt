@@ -3,31 +3,38 @@ package com.itsme.amkush.hooks
 import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import com.itsme.amkush.security.FrameProducerNativeLoader
 import com.itsme.amkush.utils.Logger
 
 object NativeFrameProducer {
 
     private const val TAG = "NativeFrameProducer"
 
-    private var libraryLoaded = false
+    private val libraryLoaded: Boolean
+        get() = FrameProducerNativeLoader.ensureLoaded()
 
 
 
     private var activePfd: ParcelFileDescriptor? = null
 
     init {
-        try {
-            System.loadLibrary("frame_producer")
-            libraryLoaded = true
-            Logger.i(Logger.HOOK, "$TAG native library loaded")
-        } catch (e: UnsatisfiedLinkError) {
-            Logger.e("$TAG Failed to load frame_producer native library: ${e.message}")
+        if (libraryLoaded) {
+            Logger.i(Logger.HOOK, "$TAG native library available")
+        } else {
+            Logger.e("$TAG frame_producer native library unavailable")
         }
     }
 
 
 
     fun startWithUri(context: Context, uri: Uri): Boolean {
+        // Retry with the application native-library directory before resolving
+        // the URI. This is important for split APKs and for a producer start
+        // that occurs after a transient class-loader failure in Application.
+        if (!FrameProducerNativeLoader.ensureLoaded(context)) {
+            Logger.e("$TAG startWithUri() skipped — frame_producer is unavailable")
+            return false
+        }
 
         activePfd?.runCatching { close() }
         activePfd = null
@@ -69,31 +76,52 @@ object NativeFrameProducer {
 
 
             val selinuxState = try {
-                Runtime.getRuntime()
-                    .exec(arrayOf("su", "-c", "cat /sys/fs/selinux/enforce"))
-                    .also { it.waitFor() }
-                    .inputStream.bufferedReader().readText().trim()
+                val enforceFile = java.io.File("/sys/fs/selinux/enforce")
+                if (enforceFile.exists() && enforceFile.canRead()) {
+                    enforceFile.readText().trim()
+                } else {
+                    Runtime.getRuntime()
+                        .exec(arrayOf("su", "-c", "cat /sys/fs/selinux/enforce"))
+                        .also { it.waitFor() }
+                        .inputStream.bufferedReader().readText().trim()
+                }
             } catch (_: Exception) { "1" }
             val wasEnforcing = selinuxState == "1"
 
             if (wasEnforcing) {
                 Logger.i(Logger.HOOK, "$TAG: disabling SELinux for IPC connect window")
-                Runtime.getRuntime()
-                    .exec(arrayOf("su", "-c", "setenforce 0"))
-                    .waitFor()
-                Thread.sleep(80)
+                try {
+                    Runtime.getRuntime()
+                        .exec(arrayOf("su", "-c", "setenforce 0"))
+                        .waitFor()
+                    Thread.sleep(40)
+                } catch (e: Exception) {
+                    Logger.w("$TAG: failed to setenforce 0: ${e.message}")
+                }
             }
 
+
+            // [V15 A11-IPC2] setenforce 0 is kernel-blocked on some devices
+            // (MTK/Android 11): open the handshake with live sepolicy rules.
+            try {
+                com.itsme.amkush.security.SelinuxIpc.applyIpcRules(TAG)
+            } catch (e: Exception) {
+                Logger.w("$TAG: IPC sepolicy grant failed: ${e.message}")
+            }
 
             val rc = try {
                 nativeStart(sourcePath)
             } finally {
 
                 if (wasEnforcing) {
-                    Runtime.getRuntime()
-                        .exec(arrayOf("su", "-c", "setenforce 1"))
-                        .waitFor()
-                    Logger.i(Logger.HOOK, "$TAG: SELinux restored to enforcing")
+                    try {
+                        Runtime.getRuntime()
+                            .exec(arrayOf("su", "-c", "setenforce 1"))
+                            .waitFor()
+                        Logger.i(Logger.HOOK, "$TAG: SELinux restored to enforcing")
+                    } catch (e: Exception) {
+                        Logger.w("$TAG: failed to setenforce 1: ${e.message}")
+                    }
                 }
             }
 
@@ -132,6 +160,7 @@ object NativeFrameProducer {
     private external fun nativeStop()
     private external fun nativeSetOverlayParams(panX: Int, panY: Int, scaleQ16: Int)
     private external fun nativeSetRotation(degrees: Int)
+    private external fun nativeSetChromaOverride(overrideIsNv21: Int)
     private external fun nativeSetPaused(paused: Boolean)
 
     /**
@@ -172,6 +201,25 @@ object NativeFrameProducer {
             nativeSetPaused(paused)
         } catch (e: Throwable) {
             Logger.e("$TAG setPaused() threw: ${e.message}")
+        }
+    }
+
+    /**
+     * [gstreamer.4] Chroma A/B for the opaque 0x22 stream. Lets a SINGLE APK test
+     * both chroma orders on-device without a rebuild:
+     *   -1 -> unset (use the build-time -DUNISOC_22_CHROMA default)
+     *    0 -> force NV12  (no U/V swap)
+     *    1 -> force NV21  (U/V swapped)
+     * The value is written to the shared header and read by cameraserver's
+     * injector; every injection decision is logged as [CHROMA A/B] with the stream
+     * role + size + effective order, so logcat tells us which order each stream wants.
+     */
+    fun setChromaOverride(overrideIsNv21: Int) {
+        if (!libraryLoaded) return
+        try {
+            nativeSetChromaOverride(overrideIsNv21)
+        } catch (e: Throwable) {
+            Logger.e("$TAG setChromaOverride() threw: ${e.message}")
         }
     }
 }

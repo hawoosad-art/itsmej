@@ -13,7 +13,7 @@ interface ISurfaceInjector {
     /**
      * Register a set of camera surfaces with their per-surface requirements.
      * InjectionService attaches an ImageWriter to each surface and begins
-     * pushing FFmpeg-decoded frames into them.
+     * pushing GStreamer-decoded frames into them.
      *
      * @param surfaces  Surface objects from createCaptureSession / setPreviewDisplay
      * @param widths    Per-surface output width  (index-matched to surfaces)
@@ -35,8 +35,8 @@ interface ISurfaceInjector {
     void unregisterSession(String sessionId);
 
     /**
-     * Start (or restart) the FFmpeg decoder with the given URL.
-     * InjectionService opens an AVFormatContext on the URL and begins
+     * Start (or restart) the GStreamer decoder with the given URL.
+     * InjectionService opens a GStreamer URI pipeline on the URL and begins
      * calling SurfaceRouter.onFrameAvailable() for each decoded I420 frame.
      *
      * @param url  RTSP / HLS / HTTP(S) / local file URL
@@ -52,6 +52,6 @@ interface ISurfaceInjector {
      */
     void hotSwap(String url);
 
-    /** Hard stop — tears down all sessions and closes the FFmpeg decoder. */
+    /** Hard stop — tears down all sessions and closes the GStreamer decoder. */
     void stopAll();
 }

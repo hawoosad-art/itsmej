@@ -10,7 +10,7 @@ data class HookStatus(
 object HookStatusRegistry {
     /**
      * V4.4: All Java/Kotlin hooks removed. Injection is handled entirely at the
-     * native HAL level by the Zygisk module. No Java-level hooks are registered.
+     * native HAL level by the ptrace-injected hook library. No Java-level hooks are registered.
      */
     fun getAllHooks(): List<HookStatus> = emptyList()
 }

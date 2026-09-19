@@ -28,7 +28,7 @@ class CrashLoopNotifier(private val context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "FaceGate Safety Alerts",
+                "EcomCam Safety Alerts",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Critical alerts for camera hook safety and crash loops"
@@ -66,7 +66,7 @@ class CrashLoopNotifier(private val context: Context) {
             .setStyle(
                 NotificationCompat.BigTextStyle()
                     .bigText(
-                        "FaceGate detected $crashCount crashes in cameraserver. " +
+                        "EcomCam detected $crashCount crashes in cameraserver. " +
                         "The module was automatically disabled to prevent bootloop.\n\n" +
                         "Tap 'Reset & Re-enable' to try again (requires reboot)."
                     )

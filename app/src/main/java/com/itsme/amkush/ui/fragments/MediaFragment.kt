@@ -25,6 +25,7 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import androidx.compose.ui.viewinterop.AndroidView
@@ -34,10 +35,15 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.itsme.amkush.AppState
 import com.itsme.amkush.hooks.NativeFrameProducer
 import android.provider.Settings
+import com.itsme.amkush.overlay.MediaSlotState
 import com.itsme.amkush.overlay.OverlayService
+import com.itsme.amkush.overlay.OverlayState
 import com.itsme.amkush.services.InjectionService
 import com.itsme.amkush.utils.Logger
 import com.itsme.amkush.utils.SharedPrefs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val Violet  = Color(0xFF6C63FF)
 private val Pink    = Color(0xFFFF4D9D)
@@ -55,10 +61,12 @@ fun MediaContent(
 ) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val scope = rememberCoroutineScope()
 
-    var mediaUri  by remember { mutableStateOf<Uri?>(null) }
-    var fileName  by remember { mutableStateOf<String?>(null) }
-    var isVideo   by remember { mutableStateOf(false) }
+    var activeSlot by remember { mutableIntStateOf(OverlayState.activeSlot) }
+    var mediaUri  by remember { mutableStateOf<Uri?>(MediaSlotState.getSlot(OverlayState.activeSlot).uri) }
+    var fileName  by remember { mutableStateOf<String?>(MediaSlotState.getSlot(OverlayState.activeSlot).label.takeUnless { it == "Empty" }) }
+    var isVideo   by remember { mutableStateOf(MediaSlotState.getSlot(OverlayState.activeSlot).isVideo) }
     var isPlaying by remember { mutableStateOf(false) }
     var zoom      by remember { mutableFloatStateOf(1f) }
     var panX      by remember { mutableFloatStateOf(0f) }
@@ -100,10 +108,20 @@ fun MediaContent(
         if (!saved.isNullOrEmpty()) {
             try {
                 val uri = Uri.parse(saved)
-                mediaUri = uri
-                fileName = getFileName(context, uri)
-                val mime = context.contentResolver.getType(uri)
-                isVideo = mime?.startsWith("video/") == true
+                val slotIdx = SharedPrefs.getLastUsedSlot()
+                /* [V87] restore into ITS OWN slot and only while that slot is
+                 * empty. The old code wrote the last-picked file over slot 0
+                 * on every tab recompose — after uploading S1,S2,S3 with
+                 * different media, tapping S1 previewed S2/S3 content. */
+                if (MediaSlotState.getSlot(slotIdx).uri == null) {
+                    val name = getFileName(context, uri)
+                    val mime = context.contentResolver.getType(uri)
+                    val vid = mime?.startsWith("video/") == true
+                    MediaSlotState.setSlot(slotIdx, uri, name ?: "Media", vid)
+                    if (activeSlot == slotIdx) {
+                        mediaUri = uri; fileName = name; isVideo = vid
+                    }
+                }
             } catch (e: SecurityException) {
                 SharedPrefs.setLastUsedUrl(null)
                 Logger.e("Media URI permission lost, clearing saved URI", e)
@@ -140,8 +158,11 @@ fun MediaContent(
                 isVideo = mime?.startsWith("video/") == true
                 isPlaying = false
                 zoom = 1f; panX = 0f; panY = 0f
+                MediaSlotState.setSlot(activeSlot, uri, fileName ?: "Media", isVideo)
+                OverlayState.setActiveSlot(activeSlot)
                 SharedPrefs.setLastUsedUrl(uri.toString())
-                Toast.makeText(context, "Media selected: $fileName", Toast.LENGTH_SHORT).show()
+                SharedPrefs.setLastUsedSlot(activeSlot)
+                Toast.makeText(context, "Media selected for S${activeSlot + 1}: $fileName", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -157,10 +178,23 @@ fun MediaContent(
 
     fun clearMedia() {
         videoViewRef?.stopPlayback()
+        MediaSlotState.setSlot(activeSlot, null, "Empty", false)
         mediaUri = null; fileName = null; isPlaying = false
         zoom = 1f; panX = 0f; panY = 0f
         SharedPrefs.setLastUsedUrl(null)
-        Toast.makeText(context, "Media cleared", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "S${activeSlot + 1} cleared", Toast.LENGTH_SHORT).show()
+    }
+
+    fun selectSlot(i: Int) {
+        videoViewRef?.stopPlayback()
+        activeSlot = i
+        OverlayState.setActiveSlot(i)
+        val s = MediaSlotState.getSlot(i)
+        mediaUri = s.uri
+        fileName = s.uri?.let { s.label.takeUnless { l -> l == "Empty" } }
+        isVideo = s.isVideo
+        isPlaying = false
+        zoom = 1f; panX = 0f; panY = 0f
     }
 
     fun togglePlay() {
@@ -175,8 +209,8 @@ fun MediaContent(
             Toast.makeText(context, "No target app selected", Toast.LENGTH_LONG).show()
             return
         }
-        val uri = mediaUri ?: run {
-            Toast.makeText(context, "Upload media first", Toast.LENGTH_SHORT).show()
+        val uri = MediaSlotState.activeUri ?: run {
+            Toast.makeText(context, "Upload media to S${activeSlot + 1} first", Toast.LENGTH_SHORT).show()
             return
         }
         val streamUrl = SharedPrefs.getStreamUrl()
@@ -199,16 +233,23 @@ fun MediaContent(
 
 
         if (AppState.useNativeHook) {
-            val ok = NativeFrameProducer.startWithUri(context, uri)
-            if (!ok) {
-                Toast.makeText(context, "Native frame producer failed to start", Toast.LENGTH_LONG).show()
-                return
+            scope.launch(Dispatchers.IO) {
+                val ok = NativeFrameProducer.startWithUri(context, uri)
+                withContext(Dispatchers.Main) {
+                    if (!ok) {
+                        Toast.makeText(context, "Native frame producer failed to start", Toast.LENGTH_LONG).show()
+                        return@withContext
+                    }
+                    AppState.activeTargetPackage = pkg
+                    OverlayService.start(context)
+                    AppState.injectionSource = "media"
+                    isInjecting = true
+                    Toast.makeText(context, "Injection started", Toast.LENGTH_SHORT).show()
+                }
             }
-            AppState.activeTargetPackage = pkg
-            OverlayService.start(context)
+            return
         } else {
             InjectionService.start(context, pkg, mediaUri = uri.toString())
-
         }
 
         AppState.injectionSource = "media"
@@ -217,10 +258,18 @@ fun MediaContent(
     }
 
     fun stopInjection() {
-
         if (AppState.useNativeHook) {
-            NativeFrameProducer.stop()
-            OverlayService.stop(context)
+            scope.launch(Dispatchers.IO) {
+                NativeFrameProducer.stop()
+                withContext(Dispatchers.Main) {
+                    OverlayService.stop(context)
+                    AppState.injectionSource = null
+                    AppState.activeTargetPackage = null
+                    isInjecting = false
+                    Toast.makeText(context, "Injection stopped", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
         } else {
             InjectionService.stop(context)
         }
@@ -241,9 +290,9 @@ fun MediaContent(
             },
             text = {
                 Text(
-                    "FaceGate needs the \"Display over other apps\" permission to show " +
+                    "EcomCam needs the \"Display over other apps\" permission to show " +
                     "pan/zoom floating controls while injection is active.\n\n" +
-                    "Tap \"Open Settings\", find FaceGate in the list, and enable the toggle.",
+                    "Tap \"Open Settings\", find EcomCam in the list, and enable the toggle.",
                     color = Color(0xAAFFFFFF), fontSize = 13.sp
                 )
             },
@@ -330,10 +379,10 @@ fun MediaContent(
                                 val u = pendingUri ?: return@clickable
                                 val pkg = pendingPkg ?: return@clickable
                                 SharedPrefs.setStreamUrl(null)
-                                InjectionService.start(context, pkg, mediaUri = u.toString())
+                                InjectionService.start(context, pkg, mediaUri = u.toString(), streamUrl = null)
                                 AppState.injectionSource = "media"
                                 isInjecting = true
-                                Toast.makeText(context, "Injection started", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Injection started (Local Media)", Toast.LENGTH_SHORT).show()
                             }
                             .padding(horizontal = 14.dp, vertical = 9.dp),
                         contentAlignment = Alignment.Center
@@ -351,10 +400,10 @@ fun MediaContent(
                                 val url = pendingStreamUrl ?: return@clickable
                                 val pkg = pendingPkg ?: return@clickable
                                 mediaUri = null; SharedPrefs.setLastUsedUrl(null)
-                                InjectionService.start(context, pkg, streamUrl = url)
+                                InjectionService.start(context, pkg, streamUrl = url, mediaUri = null)
                                 AppState.injectionSource = "stream"
                                 isInjecting = true
-                                Toast.makeText(context, "Injection started", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Injection started (Live Stream)", Toast.LENGTH_SHORT).show()
                             }
                             .padding(horizontal = 14.dp, vertical = 9.dp),
                         contentAlignment = Alignment.Center
@@ -390,6 +439,58 @@ fun MediaContent(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
 
+        // ── Media slots S1/S2/S3 — pick which slot to upload into / inject ──
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            for (i in 0 until MediaSlotState.SLOT_COUNT) {
+                val filled = MediaSlotState.getSlot(i).uri != null
+                val active = activeSlot == i
+                val slotBg: Modifier = if (active)
+                    Modifier.background(Brush.linearGradient(listOf(Violet, Pink)))
+                else
+                    Modifier.background(Surface)
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .then(slotBg)
+                        .border(
+                            1.dp,
+                            when {
+                                active -> Color.Transparent
+                                filled -> GreenOk.copy(alpha = 0.45f)
+                                else -> Border
+                            },
+                            RoundedCornerShape(12.dp)
+                        )
+                        .clickable { selectSlot(i) }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "S${i + 1}",
+                            color = if (active) Color.White else TextMid,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            if (filled) "● filled" else "○ empty",
+                            color = when {
+                                active -> Color.White
+                                filled -> GreenOk
+                                else -> TextSec
+                            },
+                            fontSize = 8.sp
+                        )
+                    }
+                }
+            }
+        }
+
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -403,7 +504,7 @@ fun MediaContent(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("⬆", fontSize = 12.sp, color = Color.White)
-                    Text("Upload Media", color = Color.White, fontSize = 12.sp)
+                    Text("Upload to S${activeSlot + 1}", color = Color.White, fontSize = 12.sp)
                 }
             }
 

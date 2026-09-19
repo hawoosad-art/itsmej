@@ -27,6 +27,9 @@ object TombstoneSender {
 
     private val seenNames = mutableSetOf<String>()
 
+    /* [V88] unrooted devices (Pixel 7 Pro) spammed "poll failed: no su"
+     * every 5s forever (703 lines in one capture). One miss = permanent off. */
+    @Volatile private var suMissing = false
     @Volatile private var handlerThread: HandlerThread? = null
     @Volatile private var handler: Handler? = null
 
@@ -92,6 +95,9 @@ object TombstoneSender {
             } else {
                 Logger.i(TAG, "No existing tombstones — directory is clean")
             }
+        } catch (e: java.io.IOException) {
+            suMissing = true
+            Logger.w(TAG, "su not present — tombstone sender disabled on this device")
         } catch (e: Exception) {
             Logger.w(TAG, "clearOldTombstones failed: ${e.message}")
         }
@@ -99,8 +105,10 @@ object TombstoneSender {
 
     private fun schedulePoll() {
         handler?.postDelayed({
-            pollForNewTombstones()
-            schedulePoll()
+            if (!suMissing) {
+                pollForNewTombstones()
+                schedulePoll()
+            }
         }, POLL_INTERVAL_MS)
     }
 
@@ -120,6 +128,9 @@ object TombstoneSender {
                 Logger.i(TAG, "New tombstone detected: $name — capturing")
                 captureTombstone(name)
             }
+        } catch (e: java.io.IOException) {
+            suMissing = true
+            Logger.w(TAG, "su not present (${e.message}) — tombstone sender disabled on this device")
         } catch (e: Exception) {
             Logger.w(TAG, "poll failed: ${e.message}")
         }

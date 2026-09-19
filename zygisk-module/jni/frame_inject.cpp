@@ -10,6 +10,7 @@
 #include <android/api-level.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <sys/system_properties.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -17,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+#include <mutex>
+#include <atomic>
 #include <limits.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -38,6 +41,61 @@ struct dma_buf_sync { uint64_t flags; };
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+// Version marker - increment on every fix so logs show which build is running
+// [gstreamer.4] V9: fixed the blue tint — the 0x23 (YCbCr420-888) camera-app
+// preview stream is now written NV12 (no U/V swap) on MediaTek/OPPO via a
+// build-time default (-DUNISOC_23_CHROMA=nv12) + runtime override, instead of the
+// hard-coded NV21 that made the OPPO camera-app face blue. Also keeps V8's
+// quality: bilinear scale + native-res ring.
+#define FRAME_INJECT_VERSION "V84-AMKUSH.70-GZDROPBOX-20260914"
+
+// FRAME_BUILD_ID — the exact git branch + commit SHA this .so was built from,
+// injected by the CI workflow (same value as HOOK_PROXY_VERSION). It is baked
+// into libhookProxy.so at compile time, so it CANNOT lie about which build is
+// running. Logged in a loud banner at init AND appended to every chroma decision
+// log line, so the on-device logcat you upload to Mylogs proves whether the APK
+// is the fresh gstreamer.3 build or a stale one. Falls back to "dev-unknown" if
+// the build did not pass it.
+#ifndef FRAME_BUILD_ID
+#define FRAME_BUILD_ID "dev-unknown"
+#endif
+
+// [gstreamer.4] Chroma A/B build-time default for the opaque 0x22 stream.
+// Set by CMake from -DUNISOC_22_CHROMA=nv12|nv21 (see CMakeLists.txt).
+// If compiled outside that CMake (e.g. a scratch build), default to nv12
+// (the gstreamer.3 behavior) so the build still works.
+#ifndef UNISOC_22_IS_NV21
+#define UNISOC_22_IS_NV21 0
+#endif
+#ifndef UNISOC_22_DEFAULT_IS_NV21
+#define UNISOC_22_DEFAULT_IS_NV21 UNISOC_22_IS_NV21
+#endif
+// [gstreamer.4 blue fix] The SAME 0x23 (YCbCr420-888) stream is consumed as NV21
+// (U/V swapped) on the UNISOC/TECNO device but as NV12 (no swap) on the
+// MediaTek/OPPO device. A single hard-coded order cannot be right on both, so we
+// expose a build-time default (CMake -DUNISOC_23_CHROMA=nv12|nv21) AND a runtime
+// override (the same chroma_override field the app drives), defaulting to nv12 so
+// the MediaTek camera-app preview is no longer blue.
+#ifndef UNISOC_23_IS_NV21
+#define UNISOC_23_IS_NV21 0
+#endif
+#ifndef UNISOC_23_DEFAULT_IS_NV21
+#define UNISOC_23_DEFAULT_IS_NV21 UNISOC_23_IS_NV21
+#endif
+
+// [gstreamer.4] Chroma A/B rationale. The fresh-build logs proved the SAME
+// opaque 0x22 (IMPLEMENTATION_DEFINED) payload is correct on one stream (role=2
+// VIDEO) and blue on another (role=1 PREVIEW), and stale builds saw it blue as
+// BOTH NV21 and NV12. AOSP IMPLEMENTATION_DEFINED carries no chroma-order info,
+// so the vendor gralloc decides it per stream/consumer — a single hard-coded
+// order cannot be trusted across devices. We therefore expose:
+//   - a build-time default (-DUNISOC_22_CHROMA=nv12|nv21, via CMake),
+//   - a runtime override (frame_inject_set_chroma_override) so ONE APK tests both,
+//   - per-stream logging of role+format+size+effective order ([CHROMA A/B]),
+//   so a single device run decisively tells us which order each consumer wants.
+// 0x11 SP -> NV12, 0x23 420_888 -> NV21 (kept, see below).
+
 
 typedef int  (*fn_AHardwareBuffer_lock)(
         AHardwareBuffer *, uint64_t usage, int32_t fence,
@@ -80,6 +138,278 @@ static fn_AHardwareBuffer_unlock           g_unlock           = nullptr;
 static fn_AHardwareBuffer_describe         g_describe         = nullptr;
 static fn_AHardwareBuffer_createFromHandle g_createFromHandle = nullptr;
 static fn_AHardwareBuffer_release          g_release          = nullptr;
+
+// [gstreamer.4] Chroma A/B. The build-time default is baked in as
+// UNISOC_22_DEFAULT_IS_NV21 (0 = NV12 via -DUNISOC_22_CHROMA=nv12, 1 = NV21).
+// The app can override at runtime by writing the shared FrameSourceHeader
+// chroma_override field (NativeFrameProducer.setChromaOverride), which the
+// injector reads via frame_source_get_chroma_override(). The value semantics:
+//   -1 = unset (fall back to kChromaDefault)
+//    0 = force NV12   (no U/V swap)
+//    1 = force NV21   (U/V swap)
+static constexpr int kChromaDefault = UNISOC_22_DEFAULT_IS_NV21;
+
+// [V11 PCHROMA] Device-family detection for the per-role chroma defaults.
+// Reads the same properties the Kotlin side uses (ro.board.platform then
+// ro.hardware). Cached after first call. 1 = UNISOC/Spreadtrum, 0 = other.
+/* [V19] UBWC read-touch is a Qualcomm workaround; on MTK it BLOCKS on the
+ * encoder stream (serializes to encoder latency -> ~11 fps -> slow-motion
+ * recordings, 14.mediatek.5). Gate every touch lock to Qualcomm. */
+static bool platform_is_qcom(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        char hw[92] = {0}, board[92] = {0};
+        __system_property_get("ro.hardware", hw);
+        __system_property_get("ro.board.platform", board);
+        cached = (strstr(hw, "qcom") || strstr(board, "qcom") ||
+                  strstr(board, "kona") || strstr(board, "lito") ||
+                  strstr(board, "sm8") || strstr(board, "sdm") ||
+                  strstr(board, "msm")) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static bool platform_is_unisoc(void) {
+    static int is_unisoc = -1;
+    if (is_unisoc >= 0) return is_unisoc == 1;
+    char val[PROP_VALUE_MAX + 1] = {0};
+    char p[PROP_VALUE_MAX + 1] = {0};
+    if (__system_property_get("ro.board.platform", val) <= 0 || val[0] == '\0') {
+        __system_property_get("ro.hardware", val);
+    }
+    for (int i = 0; val[i] && i < PROP_VALUE_MAX; i++)
+        p[i] = (char)((val[i] >= 'A' && val[i] <= 'Z') ? val[i] + 32 : val[i]);
+    is_unisoc = (strstr(p, "unisoc") || strstr(p, "ums") || strstr(p, "sprd") ||
+                 strstr(p, "sc986") || strstr(p, "sc983") || strstr(p, "tiger")) ? 1 : 0;
+    LOGI("[build=%s] V11 PCHROMA: platform='%s' → preview chroma default %s",
+         FRAME_BUILD_ID, p, is_unisoc ? "NV21 (unisoc)" : "NV12");
+    return is_unisoc == 1;
+}
+
+int frame_inject_get_chroma_override(void) {
+    return frame_source_get_chroma_override();
+}
+
+void frame_inject_set_chroma_override(int override_is_nv21) {
+    const int v = (override_is_nv21 > 1) ? 1 : (override_is_nv21 < 0 ? -1 : override_is_nv21);
+    frame_source_set_chroma_override(v);
+    LOGI("[build=%s] FRAME_CHROMA_OVERRIDE set to %d (%s); build default=%d (%s)",
+         FRAME_BUILD_ID, v, v == 1 ? "force NV21" : (v == 0 ? "force NV12" : "revert to default"),
+         kChromaDefault, kChromaDefault ? "NV21" : "NV12");
+}
+
+/* ── [V54 zoom] app crop region (ANDROID_SCALER_CROP_REGION) ───────────────
+ * The camera app zooms by shrinking the crop region inside the active array;
+ * the preview stream is cropped by the framework, but our injected JPEG is
+ * encoded from the FULL src frame — so photos ignored the zoom ("takes the
+ * whole thing"). hook_proxy feeds the latest crop region here on every
+ * capture result; inject_jpeg then encodes only the mapped sub-rectangle. */
+static int32_t g_crop_region[4] = {0, 0, 0, 0};   /* x, y, w, h  (active-array coords) */
+static int32_t g_active_array[4] = {0, 0, 0, 0};  /* x, y, w, h */
+static bool    g_crop_valid = false;
+
+void frame_inject_set_crop(const int32_t crop[4], const int32_t active[4]) {
+    if (!crop || !active) return;
+    if (crop[2] <= 0 || crop[3] <= 0 || active[2] <= 0 || active[3] <= 0) return;
+    const bool changed = memcmp(g_crop_region, crop, sizeof(g_crop_region)) != 0 ||
+                         memcmp(g_active_array, active, sizeof(g_active_array)) != 0 ||
+                         !g_crop_valid;
+    memcpy(g_crop_region, crop, sizeof(g_crop_region));
+    memcpy(g_active_array, active, sizeof(g_active_array));
+    g_crop_valid = true;
+    if (changed) {
+        LOGI("[V54 zoom] crop region -> [%d,%d %dx%d] of active [%d,%d %dx%d]",
+             crop[0], crop[1], crop[2], crop[3],
+             active[0], active[1], active[2], active[3]);
+    }
+}
+
+/* Map the active-array crop into src pixel coordinates, snapped to even
+ * boundaries (4:2:0 chroma). Returns false when not zoomed (crop ~= full
+ * active array) or when the mapping is degenerate — caller then encodes the
+ * full frame as before. */
+static bool zoom_subrect(int src_w, int src_h, int *rx, int *ry, int *rw, int *rh) {
+    if (!g_crop_valid) return false;
+    const int aw = g_active_array[2], ah = g_active_array[3];
+    /* Not zoomed? (crop covers >=99% of the active array) */
+    if ((int64_t)g_crop_region[2] * 100 >= (int64_t)aw * 99 &&
+        (int64_t)g_crop_region[3] * 100 >= (int64_t)ah * 99) return false;
+    int x = (int)(((int64_t)g_crop_region[0] * src_w) / aw);
+    int y = (int)(((int64_t)g_crop_region[1] * src_h) / ah);
+    int w = (int)(((int64_t)g_crop_region[2] * src_w) / aw);
+    int h = (int)(((int64_t)g_crop_region[3] * src_h) / ah);
+    x &= ~1; y &= ~1;            /* even align */
+    w = (w + 1) & ~1; h = (h + 1) & ~1;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > (src_w & ~1)) w = (src_w & ~1) - x;
+    if (y + h > (src_h & ~1)) h = (src_h & ~1) - y;
+    if (w < 64 || h < 64) return false;   /* degenerate — keep full frame */
+    *rx = x; *ry = y; *rw = w; *rh = h;
+    return true;
+}
+
+// Resolve whether the destination 0x22 (IMPLEMENTATION_DEFINED) stream must be
+// written NV21 (U/V swapped) or NV12. Reads the app-set value from the shared
+// header (source of truth) so the app can A/B a single APK at runtime; -1 (unset)
+// falls back to the build-time -DUNISOC_22_CHROMA default.
+// [V11 PCHROMA] PREVIEW-role streams are consumer-specific per DEVICE FAMILY:
+// the TECNO BG6 (UNISOC ums9230, 13.unisoc.1 @ 235da71) preview rendered BLUE
+// while written NV12, i.e. the UNISOC preview consumer wants NV21; the OPPO
+// CPH2387 (MediaTek mt6765) preview was blue as NV21 (V8) so it wants NV12.
+// Video/FaceTec consumers want NV12 on both families (chrome screenshots).
+static bool frame_22_is_nv21(StreamRole role, uint32_t w, uint32_t h) {
+    const int o = frame_source_get_chroma_override();   // -1 unset, 0 NV12, 1 NV21
+    if (o == 0)  return false;                 // explicit force NV12
+    if (o == 1)  return true;                  // explicit force NV21
+    if (role == STREAM_ROLE_PREVIEW) return platform_is_unisoc();
+    // [V13] 13.unisoc.3: UNISOC camera-app VIDEO encoder (1280x720) rendered
+    // BLUE as NV12. [V18] 13.unisoc.5 @ V17: the 1080p recording was ALSO blue
+    // as NV12 (261 inj) while 720p-as-NV21 stayed correct => the UNISOC
+    // recorder wants NV21 at every dim. FaceTec (browser) preferred NV12 on
+    // 1080p long ago; recording wins now (override input can flip per build).
+    if (platform_is_unisoc()) return true;
+    return kChromaDefault != 0;                // unset -> build-time default
+}
+
+// Resolve whether the destination 0x23 (YCbCr420-888) stream must be written NV21
+// (U/V swapped) or NV12. Like 0x22, this is consumer-specific (UNISOC preview
+// wants NV21, MediaTek preview wants NV12, video/FaceTec want NV12 on both).
+// Honour the same app-driven chroma_override (0=NV12, 1=NV21,
+// -1=unset -> build-time -DUNISOC_23_CHROMA default for non-preview roles).
+static bool frame_23_is_nv21(StreamRole role, uint32_t w, uint32_t h) {
+    const int o = frame_source_get_chroma_override();   // -1 unset, 0 NV12, 1 NV21
+    if (o == 0)  return false;                 // explicit force NV12
+    if (o == 1)  return true;                  // explicit force NV21
+    if (role == STREAM_ROLE_PREVIEW) return platform_is_unisoc();
+    if (platform_is_unisoc() && !(w == 1920 && h == 1080)) return true;  // [V13]
+    return UNISOC_23_DEFAULT_IS_NV21 != 0;     // unset -> build-time default
+}
+
+// Human-readable role label for per-stream logs.
+static const char* frame_role_name(StreamRole role) {
+    switch (role) {
+        case STREAM_ROLE_PREVIEW:   return "PREVIEW";
+        case STREAM_ROLE_VIDEO:     return "VIDEO";
+        case STREAM_ROLE_SNAPSHOT:  return "SNAPSHOT";
+        default:                    return "?";
+    }
+}
+
+// [V10 SHARP] Light 4-neighbour unsharp mask on the Y plane. The FaceTec/browser
+// stream (1920x1080) is upscaled ~2.3x from the ~816-wide source ring; bilinear
+// alone reads soft ("low quality" in the chrome screenshot). A modest strength
+// (0.6) restores perceived edge contrast without ringing on faces. Only called
+// when the destination is a >=1.4x upscale of the (post-crop) source.
+static void sharpen_y_plane(uint8_t *y, int stride, int w, int h) {
+    if (!y || w < 3 || h < 3 || stride < w) return;
+    std::vector<uint8_t> tmp((size_t)w * (size_t)h);
+    for (int j = 1; j < h - 1; j++) {
+        const uint8_t *up = y + (size_t)(j - 1) * stride;
+        const uint8_t *cu = y + (size_t)j * stride;
+        const uint8_t *dn = y + (size_t)(j + 1) * stride;
+        uint8_t *o = tmp.data() + (size_t)j * w;
+        o[0] = cu[0];
+        o[w - 1] = cu[w - 1];
+        for (int i = 1; i < w - 1; i++) {
+            int c = cu[i];
+            int blur = (up[i] + dn[i] + cu[i - 1] + cu[i + 1] + 2) >> 2;
+            int v = c + ((c - blur) * 6) / 10;
+            o[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+    for (int j = 1; j < h - 1; j++)
+        memcpy(y + (size_t)j * stride + 1, tmp.data() + (size_t)j * w + 1, (size_t)(w - 2));
+}
+
+/* ── [V26] converted-frame cache ─────────────────────────────────────────
+ * The per-ROB-fire libyuv chain (NV12->I420 deinterleave, 2MP rotate, scale,
+ * re-interleave) saturated one core on thermally-throttled devices and made
+ * the camera pipeline stall in bursts (14.mediatek A14 V25 log: 6-frame bursts
+ * then 1.5-4.8s gaps = slow-motion injection + slow recordings).  The producer
+ * writes at source rate (~24fps) while the camera fires at 30fps per stream,
+ * so most fires re-inject the SAME source frame: cache the finished
+ * destination image per (role,layout,seq) and replay it with memcpy. */
+struct ConvCache {
+    std::mutex mu;
+    bool     valid = false;
+    uint64_t key   = 0;
+    int      layout = -1;          /* 0=interleave@lower 1=flex-planar 2=semi-planar */
+    std::vector<uint8_t> y, c1, c2;
+    size_t y_len = 0, c1_len = 0, c2_len = 0;
+    int du_stride = 0, dv_stride = 0, uv_stride = 0;
+};
+static ConvCache g_conv_cache[4];
+
+static uint64_t conv_mix(uint64_t h, uint64_t v) {
+    return (h * 0x9E3779B97F4A7C15ULL) ^ (v + 0x9E3779B97F4A7C15ULL);
+}
+static uint64_t conv_cache_key(int role, uint32_t dst_w, uint32_t dst_h,
+                               int dst_stride, bool is_planar, bool is_nv21) {
+    int32_t  pan_x = 0, pan_y = 0; uint32_t scale = 0;
+    frame_source_get_overlay_params(&pan_x, &pan_y, &scale);
+    uint64_t h = 17;
+    h = conv_mix(h, frame_source_get_seq());
+    h = conv_mix(h, (uint64_t)role);
+    h = conv_mix(h, dst_w); h = conv_mix(h, dst_h);
+    h = conv_mix(h, (uint64_t)dst_stride);
+    h = conv_mix(h, is_planar ? 1 : 0); h = conv_mix(h, is_nv21 ? 1 : 0);
+    h = conv_mix(h, (uint64_t)(uint32_t)pan_x); h = conv_mix(h, (uint64_t)(uint32_t)pan_y);
+    h = conv_mix(h, scale);
+    h = conv_mix(h, frame_source_get_total_rotation());
+    return h;
+}
+static void conv_cache_store(int role, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                             uint8_t *dst_uv, int dst_stride, int du_stride, int dv_stride,
+                             int uv_stride, uint32_t dst_w, uint32_t dst_h,
+                             bool is_planar, bool is_nv21) {
+    if (role != STREAM_ROLE_PREVIEW && role != STREAM_ROLE_VIDEO) return;
+    if (!dst_y) return;
+    ConvCache &cc = g_conv_cache[role & 3];
+    std::lock_guard<std::mutex> g(cc.mu);
+    cc.key = conv_cache_key(role, dst_w, dst_h, dst_stride, is_planar, is_nv21);
+    cc.y_len = (size_t)dst_stride * dst_h;
+    cc.y.resize(cc.y_len);
+    memcpy(cc.y.data(), dst_y, cc.y_len);
+    cc.layout = (is_planar && role == STREAM_ROLE_VIDEO) ? 0
+              : is_planar ? 1 : 2;
+    if (cc.layout == 0) {
+        uint8_t *semi = (dst_u < dst_v) ? dst_u : dst_v;
+        cc.c1_len = (size_t)dst_stride * dst_h / 2;
+        cc.c1.resize(cc.c1_len); memcpy(cc.c1.data(), semi, cc.c1_len);
+        cc.c2_len = 0;
+    } else if (cc.layout == 1) {
+        cc.du_stride = du_stride; cc.dv_stride = dv_stride;
+        cc.c1_len = (size_t)du_stride * dst_h / 2;
+        cc.c2_len = (size_t)dv_stride * dst_h / 2;
+        cc.c1.resize(cc.c1_len); memcpy(cc.c1.data(), dst_u, cc.c1_len);
+        cc.c2.resize(cc.c2_len); memcpy(cc.c2.data(), dst_v, cc.c2_len);
+    } else {
+        cc.uv_stride = uv_stride;
+        cc.c1_len = (size_t)uv_stride * ((dst_h + 1) / 2);
+        cc.c1.resize(cc.c1_len); memcpy(cc.c1.data(), dst_uv, cc.c1_len);
+        cc.c2_len = 0;
+    }
+    cc.valid = true;
+}
+static bool conv_cache_replay(ConvCache &cc, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                              uint8_t *dst_uv) {
+    if (!dst_y) return false;
+    memcpy(dst_y, cc.y.data(), cc.y_len);
+    if (cc.layout == 0) {
+        uint8_t *semi = (dst_u < dst_v) ? dst_u : dst_v;
+        if (!semi) return false;
+        memcpy(semi, cc.c1.data(), cc.c1_len);
+    } else if (cc.layout == 1) {
+        if (!dst_u || !dst_v) return false;
+        memcpy(dst_u, cc.c1.data(), cc.c1_len);
+        memcpy(dst_v, cc.c2.data(), cc.c2_len);
+    } else {
+        if (!dst_uv) return false;
+        memcpy(dst_uv, cc.c1.data(), cc.c1_len);
+    }
+    return true;
+}
 
 static int fence_wait(int fd, int timeout_ms) {
     if (fd < 0) return 0;
@@ -244,7 +574,19 @@ static inline void release_ahwb(AHardwareBuffer *ahb,
 }
 
 int frame_inject_init(void) {
-    LOGI("frame_inject_init: loading libraries...");
+    LOGI("frame_inject_init: loading libraries... version=%s", FRAME_INJECT_VERSION);
+    // ── FRESH-BUILD PROOF ──────────────────────────────────────────────────
+    // FRAME_BUILD_ID is the git branch+sha baked into libhookProxy.so at
+    // compile time (never a manual string), so this banner is authoritative.
+    // Grep your Mylogs logcat for this exact line to confirm the APK running
+    // on the phone is the NEW gstreamer.4 build, not a stale/cached one.
+    LOGI("╔══════════════════════════════════════════════════════════════════╗");
+    LOGI("║ FRESH-BUILD-CHECK  version=%s", FRAME_INJECT_VERSION);
+    LOGI("║ FRESH-BUILD-CHECK  build_id=%s", FRAME_BUILD_ID);
+    LOGI("║ FRESH-BUILD-CHECK  chroma_override=%d default_0x22_nv21=%d default_0x23_nv21=%d",
+         frame_inject_get_chroma_override(), kChromaDefault, UNISOC_23_DEFAULT_IS_NV21);
+    LOGI("║ FRESH-BUILD-CHECK  (build_id == gstreamer.4-<sha> ⇒ this IS the new build)");
+    LOGI("╚══════════════════════════════════════════════════════════════════╝");
 
 
     g_libnativewindow = dlopen("libnativewindow.so", RTLD_NOW | RTLD_NOLOAD);
@@ -398,13 +740,8 @@ static uint32_t rotate_source_upright(
         const uint8_t *&out_y, const uint8_t *&out_uv,
         int &out_stride, int &out_w, int &out_h) {
     uint32_t rot = frame_source_get_total_rotation();
-    /* Only default to 180 on a first-frame race; honor valid total==0 (upright). */
-    if (rot == 0 &&
-        frame_source_get_rotation() == 0 &&
-        frame_source_get_manual_rotation() == 0 &&
-        !frame_source_ready()) {
-        rot = 180u;
-    }
+    /* [V10 ROT0] legacy 180-deg first-frame-race fallback removed: it
+     * flipped already-upright static media upside-down (OPPO CPH2387 logs). */
     out_y = src_y; out_uv = src_uv;
     out_stride = src_stride; out_w = src_w; out_h = src_h;
     if (!(rot == 90 || rot == 180 || rot == 270)) return 0;
@@ -450,7 +787,8 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                         const FrameData *src,
                         int32_t fence_fd,
                         int32_t *out_release_fence,
-                        int dmabuf_fd) {
+                        int dmabuf_fd,
+                        StreamRole role) {
     if (!hwb || !src || !out_release_fence) return false;
     *out_release_fence = -1;
 
@@ -458,9 +796,167 @@ static bool inject_yuv(AHardwareBuffer *hwb,
     g_describe(hwb, &desc);
     int actual_format = desc.format;
 
+    /* [V17 speed] bilinear 1080p scaling inside the HAL return path throttled
+     * the MTK A14 video pipeline to ~7 fps (14.mediatek.4) => slow-motion
+     * recordings. Encoders don't need pretty scaling: nearest for VIDEO. */
+    const libyuv::FilterMode filt =
+        (role == STREAM_ROLE_VIDEO) ? libyuv::kFilterNone : libyuv::kFilterBilinear;
+
     LOGD("inject_yuv: dst=%ux%u desc.fmt=0x%x desc.stride=%u src=%ux%u stride=%u fence=%d",
          dst_w, dst_h, actual_format, desc.stride,
          src->width, src->height, src->stride, fence_fd);
+
+    /* [V21 DIRECT] MTK VIDEO fast path — write through our own mmap of the
+     * dmabuf instead of the HAL lock below. Two wins:
+     *  1. SPEED: g_lockPlanes(fence_fd) blocks until the encoder releases the
+     *     frame — V18 measured 10.7 fps on 720p ("soo slow"). Our MAP_SHARED
+     *     mapping never waits (worst case one torn frame, never a stall).
+     *  2. CHROMA: the chroma placement is selectable at RUNTIME via
+     *     `persist.ecomcam.chroma`, so one build can A/B the encoder layout
+     *     without reflashing:
+     *       0 (default) = interleaved UV at stride*height          (R1, like V18)
+     *       1           = interleaved UV at stride*align64(height) (common MTK alignment)
+     *       2           = YV12 planes: V at stride*height, U at +stride*h/4
+     * Falls through to the proven HAL-lock path if fd/alloc/mmap fail. */
+    if (role == STREAM_ROLE_VIDEO && dmabuf_fd >= 0 &&
+        !platform_is_unisoc() && !platform_is_qcom()) {
+        char cprop[92] = {0};
+        __system_property_get("persist.ecomcam.chroma", cprop);
+        /* [V21.1] default 3 = interleaved at stride*ALIGN(h,32): both consulted
+         * LLMs (and the V18 field result, where stride*h interleave stayed
+         * gray) point at MTK VENC deriving chroma as stride*ALIGN(height,32)
+         * and reading it as ONE interleaved CbCr plane, ignoring the gralloc
+         * plane offsets (which is why the display looks right but the encoder
+         * goes gray). */
+        const int strat = cprop[0] ? atoi(cprop) : 3;
+        const long alloc = (long)lseek(dmabuf_fd, 0, SEEK_END);
+        const int d_w = (int)dst_w, d_h = (int)dst_h;
+        const size_t d_stride = (desc.stride > 0) ? desc.stride : dst_w;
+        const int d_chw = (d_w + 1) / 2, d_chh = (d_h + 1) / 2;
+        const size_t nominal = d_stride * (size_t)d_h;
+        const size_t aligned_off = d_stride * (size_t)(((d_h + 63) / 64) * 64);
+        const size_t aligned32_off = d_stride * (size_t)(((d_h + 31) / 32) * 32);
+        const size_t chroma_sz = d_stride * (size_t)d_chh;
+        const size_t chroma_base = (strat == 1) ? aligned_off
+                                 : (strat == 3) ? aligned32_off
+                                                : nominal;
+        const size_t need = chroma_base + chroma_sz;
+        void *mm = (alloc > 0 && alloc >= (long)need)
+                   ? mmap(nullptr, (size_t)alloc, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, dmabuf_fd, 0)
+                   : nullptr;
+        if (mm && mm != MAP_FAILED) {
+            struct dma_buf_sync d_ss = {};
+            d_ss.flags = (uint64_t)(DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &d_ss);
+            uint8_t *base = static_cast<uint8_t *>(mm);
+
+            /* Source NV12 from the ring + V21 recording rotation: a portrait
+             * source into a landscape recording is pre-rotated 90CCW (=270)
+             * to cancel the MTK player's 90CW metadata (V20 recorded sideways
+             * per 14.mediatek.6 screenshot). Manual 90/270 totals honored. */
+            uint32_t srot = frame_source_get_total_rotation();
+            if ((srot % 180) == 0 && (int)src->height > (int)src->width && d_w > d_h)
+                srot = 270;
+            const uint8_t *sy = src->y_plane;
+            const uint8_t *suv = src->uv_plane;
+            int sw = (int)src->width, sh = (int)src->height, ss = (int)src->stride;
+            std::vector<uint8_t> rot_i420, rot_nv12;
+            if (srot == 90 || srot == 180 || srot == 270) {
+                libyuv::RotationMode rm =
+                    (srot == 90)  ? libyuv::kRotate90  :
+                    (srot == 270) ? libyuv::kRotate270 : libyuv::kRotate180;
+                int rw = ((srot == 90 || srot == 270) ? sh : sw) & ~1;
+                int rh = ((srot == 90 || srot == 270) ? sw : sh) & ~1;
+                const int ruv = (rw + 1) / 2, ruvh = (rh + 1) / 2;
+                rot_i420.resize((size_t)sw * sh +
+                                2 * (size_t)((sw + 1) / 2) * ((sh + 1) / 2));
+                uint8_t *iy = rot_i420.data();
+                uint8_t *iu = iy + (size_t)sw * sh;
+                uint8_t *iv = iu + (size_t)((sw + 1) / 2) * ((sh + 1) / 2);
+                libyuv::NV12ToI420(sy, ss, suv, ss, iy, sw, iu, (sw + 1) / 2,
+                                   iv, (sw + 1) / 2, sw, sh);
+                rot_nv12.resize((size_t)rw * rh + (size_t)rw * ruvh);
+                uint8_t *ny = rot_nv12.data();
+                uint8_t *nuv = ny + (size_t)rw * rh;
+                std::vector<uint8_t> rtmp((size_t)rw * rh + 2 * (size_t)ruv * ruvh);
+                uint8_t *ry = rtmp.data();
+                uint8_t *ru = ry + (size_t)rw * rh;
+                uint8_t *rv = ru + (size_t)ruv * ruvh;
+                libyuv::I420Rotate(iy, sw, iu, (sw + 1) / 2, iv, (sw + 1) / 2,
+                                   ry, rw, ru, ruv, rv, ruv, sw, sh, rm);
+                libyuv::I420ToNV12(ry, rw, ru, ruv, rv, ruv, ny, rw, nuv, rw, rw, rh);
+                sy = ny; suv = nuv; sw = rw; sh = rh; ss = rw;
+            }
+            /* Fix3 center AR-crop so the downscale stays clean */
+            if (sw > 0 && sh > 0 &&
+                (int64_t)sw * d_h != (int64_t)sh * d_w) {
+                int cw = sw, ch = sh;
+                if ((int64_t)sw * d_h < (int64_t)sh * d_w)
+                    ch = (int)((int64_t)sw * d_h / d_w) & ~1;
+                else
+                    cw = (int)((int64_t)sh * d_w / d_h) & ~1;
+                if (cw > 0 && ch > 0 && (cw < sw || ch < sh)) {
+                    int ox = ((sw - cw) / 2) & ~1, oy = ((sh - ch) / 2) & ~1;
+                    sy  += (size_t)oy * ss + ox;
+                    suv += (size_t)(oy / 2) * ss + ox;
+                    sw = cw; sh = ch;
+                }
+            }
+            const int s_chw = (sw + 1) / 2, s_chh = (sh + 1) / 2;
+            std::vector<uint8_t> tmp_u((size_t)s_chw * s_chh);
+            std::vector<uint8_t> tmp_v((size_t)s_chw * s_chh);
+            for (int y = 0; y < s_chh; y++) {
+                const uint8_t *row = suv + (size_t)y * ss;
+                uint8_t *ru2 = tmp_u.data() + (size_t)y * s_chw;
+                uint8_t *rv2 = tmp_v.data() + (size_t)y * s_chw;
+                for (int x = 0; x < s_chw; x++) { ru2[x] = row[2 * x]; rv2[x] = row[2 * x + 1]; }
+            }
+            std::vector<uint8_t> su2((size_t)d_chw * d_chh);
+            std::vector<uint8_t> sv2((size_t)d_chw * d_chh);
+            libyuv::I420Scale(sy, ss, tmp_u.data(), s_chw, tmp_v.data(), s_chw, sw, sh,
+                              base, (int)d_stride, su2.data(), d_chw, sv2.data(), d_chw,
+                              d_w, d_h, libyuv::kFilterNone);
+            if (strat == 2) {
+                uint8_t *vp = base + nominal;
+                uint8_t *up = base + nominal + chroma_sz / 2;
+                for (int y = 0; y < d_chh; y++) {
+                    memcpy(vp + (size_t)y * d_stride, sv2.data() + (size_t)y * d_chw, d_chw);
+                    memcpy(up + (size_t)y * d_stride, su2.data() + (size_t)y * d_chw, d_chw);
+                }
+            } else {
+                uint8_t *semi = base + chroma_base;
+                for (int y = 0; y < d_chh; y++) {
+                    const uint8_t *ru3 = su2.data() + (size_t)y * d_chw;
+                    const uint8_t *rv3 = sv2.data() + (size_t)y * d_chw;
+                    uint8_t *drow = semi + (size_t)y * d_stride;
+                    for (int x = 0; x < d_chw; x++) {
+                        drow[2 * x]     = ru3[x];
+                        drow[2 * x + 1] = rv3[x];
+                    }
+                }
+            }
+            __sync_synchronize();
+            struct dma_buf_sync d_se = {};
+            d_se.flags = (uint64_t)(DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+            ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &d_se);
+            munmap(mm, (size_t)alloc);
+            static std::atomic<uint64_t> s_dc{0};
+            const uint64_t dc = s_dc.fetch_add(1, std::memory_order_relaxed);
+            if (dc < 5 || (dc % 200) == 0)
+                LOGI("inject_yuv: [V21 direct] VIDEO src=%dx%d dst=%dx%d stride=%zu alloc=%ld strat=%d chroma@%zu (nom=%zu a32=%zu a64=%zu) rot=%u dc=%llu",
+                     (int)src->width, (int)src->height, d_w, d_h, d_stride, alloc,
+                     strat, chroma_base, nominal, aligned32_off, aligned_off,
+                     srot, (unsigned long long)dc);
+            return true;
+        }
+        static std::atomic<uint64_t> s_df{0};
+        const uint64_t df = s_df.fetch_add(1, std::memory_order_relaxed);
+        if (df < 5 || (df % 200) == 0)
+            LOGW("inject_yuv: [V21 direct] fallback to lock path (alloc=%ld need=%zu strat=%d mmap_ok=%d) df=%llu",
+                 alloc, need, strat, (mm && mm != MAP_FAILED) ? 1 : 0,
+                 (unsigned long long)df);
+    }
 
     if (g_lockPlanes) {
         AHardwareBuffer_Planes planes;
@@ -529,14 +1025,21 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                     return false;
                 }
                 uint32_t mm_rot = frame_source_get_total_rotation();
-                /* Only default to 180 on a first-frame race (no frame yet, no
-                 * rotation set); honor a valid total==0 (upright/identity). */
-                if (mm_rot == 0 &&
-                    frame_source_get_rotation() == 0 &&
-                    frame_source_get_manual_rotation() == 0 &&
-                    !frame_source_ready()) {
-                    mm_rot = 180u;
-                }
+            /* [V19 rot] MTK encoders tag the recording with their own rotation
+             * metadata; baking the overlay rotation into the buffer double-
+             * rotates the recorded video (sideways, 14.mediatek.5). */
+            if (role == STREAM_ROLE_VIDEO && !platform_is_unisoc() && !platform_is_qcom()) {
+                /* [V21 rot] V19/V20 shipped rot=0 -> portrait pixels squashed into
+                 * the 720p recording and the MTK player's 90CW metadata tipped the
+                 * result sideways (14.mediatek.6 screenshot: head at right). The
+                 * encoder tags 90CW, so pre-rotate pixels 90CCW (=270) when a
+                 * portrait source meets a landscape recording: upright after the
+                 * player metadata, and no more aspect squash. Manual 90/270
+                 * totals (user overlay) are honored untouched. */
+                if ((mm_rot % 180) == 0 && ms_h > ms_w && dst_w > dst_h) mm_rot = 270;
+            }
+                /* [V10 ROT0] legacy 180-deg first-frame-race fallback removed: it
+                 * flipped already-upright static media upside-down (OPPO CPH2387 logs). */
                 std::vector<uint8_t> mm_rot_buf;
                 if (mm_rot == 90 || mm_rot == 180 || mm_rot == 270) {
                     libyuv::RotationMode rm =
@@ -580,10 +1083,43 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                     ms_y = rn_y; ms_uv = rn_uv;
                     ms_w = cr_w; ms_h = cr_h; ms_stride = cr_w;
                 }
-                libyuv::NV12Scale(ms_y, ms_stride, ms_uv, ms_stride,
-                                  ms_w, ms_h,
-                                  mm_y, mm_stride, mm_uv, mm_stride,
-                                  (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
+                // FIX for UNISOC BG6: 0x22 chroma is runtime-resolvable ([CHROMA A/B]),
+                // 0x23=NV21, 0x11=NV12. On the fresh build 0x22 as NV12 was correct on
+                // VIDEO but blue on PREVIEW, so we no longer hard-code a single order.
+                bool is_nv21 = false;
+                if (actual_format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+                    is_nv21 = frame_22_is_nv21(role, dst_w, dst_h);
+                    LOGI("inject_yuv: [build=%s] 0x22 role=%s %ux%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                         FRAME_BUILD_ID, frame_role_name(role), dst_w, dst_h,
+                         is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), kChromaDefault);
+                } else if (actual_format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+                    is_nv21 = frame_23_is_nv21(role, dst_w, dst_h);
+                    LOGI("inject_yuv: [build=%s] 0x23 role=%s %ux%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                         FRAME_BUILD_ID, frame_role_name(role), dst_w, dst_h,
+                         is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), UNISOC_23_DEFAULT_IS_NV21);
+                }
+                if (is_nv21) {
+                    size_t uv_rows = ((size_t)dst_h + 1) / 2;
+                    std::vector<uint8_t> tmp_uv((size_t)mm_stride * uv_rows);
+                    libyuv::NV12Scale(ms_y, ms_stride, ms_uv, ms_stride,
+                                      ms_w, ms_h,
+                                      mm_y, mm_stride, tmp_uv.data(), mm_stride,
+                                      (int)dst_w, (int)dst_h, filt);
+                    for (size_t r = 0; r < uv_rows; r++) {
+                        const uint8_t *srow = tmp_uv.data() + r * mm_stride;
+                        uint8_t *drow = mm_uv + r * (size_t)mm_stride;
+                        size_t cols = (size_t)((dst_w + 1) / 2) * 2;
+                        for (size_t c = 0; c + 1 < cols; c += 2) {
+                            drow[c]     = srow[c + 1];
+                            drow[c + 1] = srow[c];
+                        }
+                    }
+                } else {
+                    libyuv::NV12Scale(ms_y, ms_stride, ms_uv, ms_stride,
+                                      ms_w, ms_h,
+                                      mm_y, mm_stride, mm_uv, mm_stride,
+                                      (int)dst_w, (int)dst_h, filt);
+                }
                 __sync_synchronize();
 
                 struct dma_buf_sync mm_sync_end = {};
@@ -592,7 +1128,7 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                 munmap(mm_ptr, mm_sz);
 
                 /* UBWC read-touch — forces GPU to read from CPU-written linear region */
-                if (g_lock) {
+                if (g_lock && platform_is_qcom()) {
                     void *touch = nullptr;
                     if (g_lock(hwb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
                                -1, nullptr, &touch) == 0 && touch) {
@@ -625,14 +1161,21 @@ static bool inject_yuv(AHardwareBuffer *hwb,
 
             /* Apply source_rotation + AR-crop (mirrors the lockPlanes path) */
             uint32_t fb_rot = frame_source_get_total_rotation();
-            /* Only default to 180 on a first-frame race (no frame yet, no
-             * rotation set); honor a valid total==0 (upright/identity). */
-            if (fb_rot == 0 &&
-                frame_source_get_rotation() == 0 &&
-                frame_source_get_manual_rotation() == 0 &&
-                !frame_source_ready()) {
-                fb_rot = 180u;
+            /* [V19 rot] MTK encoders tag the recording with their own rotation
+             * metadata; baking the overlay rotation into the buffer double-
+             * rotates the recorded video (sideways, 14.mediatek.5). */
+            if (role == STREAM_ROLE_VIDEO && !platform_is_unisoc() && !platform_is_qcom()) {
+                /* [V21 rot] V19/V20 shipped rot=0 -> portrait pixels squashed into
+                 * the 720p recording and the MTK player's 90CW metadata tipped the
+                 * result sideways (14.mediatek.6 screenshot: head at right). The
+                 * encoder tags 90CW, so pre-rotate pixels 90CCW (=270) when a
+                 * portrait source meets a landscape recording: upright after the
+                 * player metadata, and no more aspect squash. Manual 90/270
+                 * totals (user overlay) are honored untouched. */
+                if ((fb_rot % 180) == 0 && fs_h > fs_w && dst_w > dst_h) fb_rot = 270;
             }
+            /* [V10 ROT0] legacy 180-deg first-frame-race fallback removed: it
+             * flipped already-upright static media upside-down (OPPO CPH2387 logs). */
             std::vector<uint8_t> fb_rot_buf;
             if (fb_rot == 90 || fb_rot == 180 || fb_rot == 270) {
                 libyuv::RotationMode rm =
@@ -682,14 +1225,47 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                 fs_w = cr_w; fs_h = cr_h; fs_stride = cr_w;
             }
 
-            libyuv::NV12Scale(fs_y, fs_stride, fs_uv, fs_stride,
-                              fs_w, fs_h,
-                              fb_y, fb_stride, fb_uv, fb_stride,
-                              (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
+            // FIX for UNISOC BG6: 0x22 chroma is runtime-resolvable ([CHROMA A/B]),
+            // 0x23=NV21, 0x11=NV12.
+            bool is_nv21 = false;
+            if (actual_format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+                is_nv21 = frame_22_is_nv21(role, dst_w, dst_h);
+                LOGI("inject_yuv: [build=%s] 0x22 role=%s %ux%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                     FRAME_BUILD_ID, frame_role_name(role), dst_w, dst_h,
+                     is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), kChromaDefault);
+            } else if (actual_format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+                is_nv21 = frame_23_is_nv21(role, dst_w, dst_h);
+                LOGI("inject_yuv: [build=%s] 0x23 role=%s %ux%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                     FRAME_BUILD_ID, frame_role_name(role), dst_w, dst_h,
+                     is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), UNISOC_23_DEFAULT_IS_NV21);
+            }
+            // SP (0x11) is NV12 on UNISOC, so is_nv21=false
+            if (is_nv21) {
+                size_t uv_rows = ((size_t)dst_h + 1) / 2;
+                std::vector<uint8_t> tmp_uv((size_t)fb_stride * uv_rows);
+                libyuv::NV12Scale(fs_y, fs_stride, fs_uv, fs_stride,
+                                  fs_w, fs_h,
+                                  fb_y, fb_stride, tmp_uv.data(), fb_stride,
+                                  (int)dst_w, (int)dst_h, filt);
+                for (size_t r = 0; r < uv_rows; r++) {
+                    const uint8_t *srow = tmp_uv.data() + r * fb_stride;
+                    uint8_t *drow = fb_uv + r * (size_t)fb_stride;
+                    size_t cols = (size_t)((dst_w + 1) / 2) * 2;
+                    for (size_t c = 0; c + 1 < cols; c += 2) {
+                        drow[c]     = srow[c + 1];
+                        drow[c + 1] = srow[c];
+                    }
+                }
+            } else {
+                libyuv::NV12Scale(fs_y, fs_stride, fs_uv, fs_stride,
+                                  fs_w, fs_h,
+                                  fb_y, fb_stride, fb_uv, fb_stride,
+                                  (int)dst_w, (int)dst_h, filt);
+            }
             __sync_synchronize();
             g_unlock(hwb, nullptr);
             /* UBWC read-touch for OPlus/Qualcomm cache coherency */
-            {
+            if (platform_is_qcom()) {
                 void *touch = nullptr;
                 if (g_lock(hwb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
                            -1, nullptr, &touch) == 0 && touch) {
@@ -718,11 +1294,188 @@ static bool inject_yuv(AHardwareBuffer *hwb,
         uint8_t *dst_y  = (uint8_t *)planes.planes[0].data;
         int dst_stride  = (int)planes.planes[0].rowStride;
 
+        if (dst_stride <= 0) {
+            dst_stride = (desc.stride > 0) ? (int)desc.stride : (int)dst_w;
+            LOGI("inject_yuv: plane[0] rowStride was 0 — defaulted to %d (desc.stride=%u dst_w=%u)",
+                 dst_stride, desc.stride, dst_w);
+        }
+
+        // V5: infer stride from Y->UV pointer diff when both strides are 0 (UNISOC BG6 opaque)
+        if (dst_stride == (int)dst_w && planes.planeCount == 1 && planes.planes[0].data) {
+            // Try to get UV pointer if we can, will be computed later, but for now log
+            LOGD("inject_yuv: V5 stride inference check dst_y=%p dst_w=%u dst_h=%u desc.stride=%u rowStride=%u",
+                 dst_y, dst_w, dst_h, desc.stride, planes.planes[0].rowStride);
+        }
+
         if (!dst_y || dst_stride <= 0) {
             LOGE("inject_yuv: plane[0] data=%p rowStride=%d — invalid",
                  (void *)dst_y, dst_stride);
             g_unlock(hwb, nullptr);
             return false;
+        }
+
+        if (actual_format == HAL_PIXEL_FORMAT_YCBCR_P010) {
+            LOGW("inject_yuv: P010 not supported, skipping");
+            g_unlock(hwb, nullptr);
+            return false;
+        }
+
+        bool is_planar = false;
+        bool is_nv21   = false;
+        uint8_t *dst_uv = nullptr;
+        int dst_uv_stride = 0;
+        uint8_t *dst_u = nullptr, *dst_v = nullptr;
+        int du_stride = 0, dv_stride = 0;
+
+        if (planes.planeCount >= 3 &&
+            planes.planes[1].pixelStride == 1 &&
+            planes.planes[2].pixelStride == 1) {
+            /* Planar 3-plane (I420 or YV12) */
+            is_planar = true;
+            if (actual_format == HAL_PIXEL_FORMAT_YV12) {
+                /* [V12 YV12-ORDER] The spec says YV12 memory is Y,V,U, but this
+                 * HAL's AHardwareBuffer_lockPlanes returns the NORMALIZED flex
+                 * order (planes[1]=U, planes[2]=V) even for YV12: on the OPPO
+                 * CPH2387 (14.mediatek.2 @ 235da71) the old spec-swap rendered
+                 * the 960x720 preview BLUE and the 1280x720 recording whitish.
+                 * Default to the normalized order; chroma_override==1 restores
+                 * the raw spec swap for HALs that really return Y,V,U. */
+                static bool yv12_order_logged = false;
+                const bool yv12_raw_swap = frame_inject_get_chroma_override() == 1;
+                if (!yv12_order_logged) {
+                    LOGI("inject_yuv: [build=%s] V12 YV12 plane order: %s (override=%d)",
+                         FRAME_BUILD_ID, yv12_raw_swap ? "raw Y,V,U swap" : "normalized planes[1]=U",
+                         frame_inject_get_chroma_override());
+                    yv12_order_logged = true;
+                }
+                if (yv12_raw_swap) {
+                    dst_u = (uint8_t *)planes.planes[2].data;
+                    du_stride = (int)planes.planes[2].rowStride;
+                    dst_v = (uint8_t *)planes.planes[1].data;
+                    dv_stride = (int)planes.planes[1].rowStride;
+                } else {
+                    dst_u = (uint8_t *)planes.planes[1].data;
+                    du_stride = (int)planes.planes[1].rowStride;
+                    dst_v = (uint8_t *)planes.planes[2].data;
+                    dv_stride = (int)planes.planes[2].rowStride;
+                }
+            } else {
+                /* Standard I420 (0x23 planar): plane 1 is U, plane 2 is V */
+                dst_u = (uint8_t *)planes.planes[1].data;
+                du_stride = (int)planes.planes[1].rowStride;
+                dst_v = (uint8_t *)planes.planes[2].data;
+                dv_stride = (int)planes.planes[2].rowStride;
+            }
+            if (du_stride <= 0) du_stride = (dst_stride + 1) / 2;
+            if (dv_stride <= 0) dv_stride = (dst_stride + 1) / 2;
+        } else {
+            /* Semi-planar (NV12 or NV21) or single-plane fallback.
+             * FIX for TECNO BG6 UNISOC T603 (mali_gralloc):
+             *   YCbCr420-888 (0x23) -> NV21
+             *   YCbCr420-SP  (0x11) -> NV12
+             *   IMPLEMENTATION_DEFINED (0x22) -> NV12  (proven on-device: the same 0x22
+             *     rendered correct color when written without a U/V swap on the role=2
+             *     VIDEO stream, and BLUE when swapped on the role=1 PREVIEW stream.)
+             * Original code forced SP=NV21 and 0x22=NV21, both wrong on this device and the
+             * cause of the blue tint. 0x22 must be written as NV12 (no swap). */
+            if (planes.planeCount >= 3 && planes.planes[1].data && planes.planes[2].data) {
+                /* 3-plane semi-planar with shared UV buffer:
+                 * Spec: plane[1]=U, plane[2]=V. If V<U => VU => NV21
+                 * This matches mali_gralloc logs on TECNO BG6: YCbCr420-888 -> NV21 */
+                if ((uintptr_t)planes.planes[2].data < (uintptr_t)planes.planes[1].data) {
+                    is_nv21 = true;
+                }
+                // Heuristic for shared interleaved buffer diff=1
+                uintptr_t diff = (uintptr_t)planes.planes[1].data > (uintptr_t)planes.planes[2].data ?
+                                 (uintptr_t)planes.planes[1].data - (uintptr_t)planes.planes[2].data :
+                                 (uintptr_t)planes.planes[2].data - (uintptr_t)planes.planes[1].data;
+                if (diff == 1) {
+                    LOGD("inject_yuv: shared UV buffer diff=1, is_nv21=%d (U=%p V=%p)",
+                         (int)is_nv21, planes.planes[1].data, planes.planes[2].data);
+                }
+                // Override based on known UNISOC mappings
+                if (actual_format == HAL_PIXEL_FORMAT_YCrCb_420_SP) {
+                    // SP on UNISOC is NV12 per mali log, even if pointer order says NV21
+                    // Keep detection result but log; for safety force NV12 on this device
+                    // We will NOT force NV21 for SP anymore.
+                    // If detection said NV21, it might be a different device, so keep it.
+                    // For BG6 specifically, we want NV12, so if format is SP, set false
+                    // unless we are sure it's NV21 from other evidence.
+                    // To fix blue on BG6, we set SP to NV12.
+                    is_nv21 = false;
+                    LOGI("inject_yuv: fmt=0x11 SP on UNISOC BG6 -> forcing NV12 (is_nv21=0) per mali_gralloc log");
+                } else if (actual_format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+                    is_nv21 = frame_23_is_nv21(role, dst_w, dst_h);
+                    LOGI("inject_yuv: fmt=0x23 420_888 -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                         is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), UNISOC_23_DEFAULT_IS_NV21);
+                }
+            } else {
+                // planeCount 1 or 2 fallback - no pointer order to detect
+                if (actual_format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+                    // UNISOC BG6: opaque 0x22 (IMPLEMENTATION_DEFINED) is consumed as
+                    // NV12 (U,V) — proven by the on-device log where the same 0x22 written
+                    // without swap (role=2 VIDEO 1280x720) renders CORRECT color while the
+                    // 0x22 written with a U/V swap (role=1 PREVIEW 960x720) is BLUE.
+                    is_nv21 = frame_22_is_nv21(role, dst_w, dst_h);
+                    LOGI("inject_yuv: [build=%s] fmt=0x22 IMPLEMENTATION_DEFINED role=%s %ux%u planeCount=%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                         FRAME_BUILD_ID, frame_role_name(role), dst_w, dst_h, planes.planeCount,
+                         is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), kChromaDefault);
+                } else if (actual_format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+                    is_nv21 = frame_23_is_nv21(role, dst_w, dst_h);
+                    LOGI("inject_yuv: fmt=0x23 420_888 planeCount=%u -> writing as %s (override=%d default=%d) [CHROMA A/B]",
+                         planes.planeCount, is_nv21 ? "NV21" : "NV12", frame_inject_get_chroma_override(), UNISOC_23_DEFAULT_IS_NV21);
+                } else if (actual_format == HAL_PIXEL_FORMAT_YCrCb_420_SP) {
+                    is_nv21 = false;
+                    LOGI("inject_yuv: fmt=0x11 SP planeCount=%u -> forcing NV12 for UNISOC BG6 per mali_gralloc", planes.planeCount);
+                }
+            }
+
+            if (planes.planeCount >= 3) {
+                dst_uv = (uint8_t *)(is_nv21 ? planes.planes[2].data : planes.planes[1].data);
+                dst_uv_stride = (int)(is_nv21 ? planes.planes[2].rowStride : planes.planes[1].rowStride);
+                if (dst_uv_stride <= 0) {
+                    dst_uv_stride = (int)(is_nv21 ? planes.planes[1].rowStride : planes.planes[2].rowStride);
+                }
+            } else if (planes.planeCount == 2) {
+                dst_uv = (uint8_t *)planes.planes[1].data;
+                dst_uv_stride = (int)planes.planes[1].rowStride;
+            } else {
+                /* planeCount == 1 - single opaque plane containing Y+UV contiguous
+                 * FIX: use actual gralloc stride if available, not just width */
+                dst_uv = dst_y + (size_t)dst_stride * (size_t)dst_h;
+                dst_uv_stride = dst_stride;
+                // For NV21 single-plane, UV is still interleaved VU after Y
+                LOGD("inject_yuv: planeCount=1 fallback dst_y=%p dst_uv=%p stride=%d is_nv21=%d", 
+                     dst_y, dst_uv, dst_stride, (int)is_nv21);
+            }
+            if (dst_uv_stride <= 0) dst_uv_stride = dst_stride;
+        }
+
+        LOGI("inject_yuv: [build=%s] format detected: fmt=0x%x is_planar=%d is_nv21=%d planeCount=%u dst_stride=%d dst_uv_stride=%d (ver=%s)",
+             FRAME_BUILD_ID, actual_format, (int)is_planar, (int)is_nv21, planes.planeCount, dst_stride, dst_uv_stride,
+             FRAME_INJECT_VERSION);
+
+        /* [V26 conv-cache] replay the cached destination image when this role
+         * is re-injecting the same source frame with identical layout — the
+         * camera fires at 30fps per stream but the producer writes at source
+         * rate, so most fires would redo the full 2MP libyuv chain for
+         * nothing (the A14 slow-motion root cause). */
+        if (role == STREAM_ROLE_PREVIEW || role == STREAM_ROLE_VIDEO) {
+            ConvCache &cc = g_conv_cache[role & 3];
+            std::lock_guard<std::mutex> cg(cc.mu);
+            if (cc.valid &&
+                cc.key == conv_cache_key(role, dst_w, dst_h, dst_stride, is_planar, is_nv21) &&
+                conv_cache_replay(cc, dst_y, dst_u, dst_v, dst_uv)) {
+                __sync_synchronize();
+                if (dmabuf_fd >= 0) {
+                    struct dma_buf_sync cs = {};
+                    cs.flags = (uint64_t)(DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+                    ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &cs);
+                }
+                g_unlock(hwb, nullptr);
+                *out_release_fence = -1;
+                return true;
+            }
         }
 
 
@@ -766,6 +1519,16 @@ static bool inject_yuv(AHardwareBuffer *hwb,
             uint32_t ov_scale  = 65536u;
             frame_source_get_overlay_params(&ov_pan_x, &ov_pan_y, &ov_scale);
 
+            /* [V26 deadband] a zoomIn->zoomOut round trip lands at 65535
+             * (72090*59578/65536^2 = 0.99998), which dragged EVERY injection
+             * into the zoom-out letterbox branch (14.mediatek A14 V25 log:
+             * scale_q16=65535 on every frame).  That branch's planar VIDEO
+             * write used the flex layout while the MTK encoder reads the
+             * lower chroma region interleaved => grayscale recordings.
+             * Treat ~1.0 with no pan as exactly 1.0 (no zoom). */
+            if (ov_scale >= 65500u && ov_scale <= 65536u && ov_pan_x == 0 && ov_pan_y == 0)
+                ov_scale = 65536u;
+
             /* Fix3: apply pan at any zoom level — previously pan was silently ignored at 1x.
              * Condition now triggers whenever pan is non-zero OR zoom is active. */
             if (ov_scale >= 65536u && ov_scale <= 65536u * 32u && src_w > 0 && src_h > 0 &&
@@ -784,8 +1547,23 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                 crop_w = (crop_w < 2) ? 2 : (crop_w & ~1);
                 crop_h = (crop_h < 2) ? 2 : (crop_h & ~1);
 
-                int cx = (src_w - crop_w) / 2 + ov_pan_x;
-                int cy = (src_h - crop_h) / 2 + ov_pan_y;
+                /* [V77] Rotate the pan vector into SOURCE space. The crop
+                 * runs on the un-rotated ring frame and the result is only
+                 * rotated upright afterwards, so on a rotated display the
+                 * buttons moved the wrong AXIS (Tab A8: press left -> frame
+                 * went up) and the wrong way (crop-shift instead of
+                 * content-follow). Transform: press direction (ux,uy) in
+                 * screen space -> crop delta R^-1(-ux,-uy) in source space. */
+                uint32_t pan_rot = frame_source_get_total_rotation();
+                int32_t pan_dx, pan_dy;
+                switch (pan_rot) {
+                    case 90:  pan_dx = -ov_pan_y; pan_dy =  ov_pan_x; break;
+                    case 180: pan_dx =  ov_pan_x; pan_dy =  ov_pan_y; break;
+                    case 270: pan_dx =  ov_pan_y; pan_dy = -ov_pan_x; break;
+                    default:  pan_dx = -ov_pan_x; pan_dy = -ov_pan_y; break;
+                }
+                int cx = (src_w - crop_w) / 2 + pan_dx;
+                int cy = (src_h - crop_h) / 2 + pan_dy;
                 if (cx < 0) cx = 0;
                 if (cx > src_w - crop_w) cx = src_w - crop_w;
                 if (cy < 0) cy = 0;
@@ -836,27 +1614,14 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                     for (uint32_t r = 0; r < dst_h; r++)
                         memset(dst_y + (size_t)r * dst_stride, 16, dst_w);
 
-                    uint8_t *dst_uv_lb = nullptr;
-                    int      dst_us_lb = 0;
-                    if (planes.planeCount >= 2 && planes.planes[1].data) {
-                        dst_uv_lb = (uint8_t *)planes.planes[1].data;
-                        dst_us_lb = (int)planes.planes[1].rowStride;
-                        /* Fill UV plane with 128 (neutral chroma) */
-                        for (uint32_t r = 0; r < dst_h / 2; r++)
-                            memset(dst_uv_lb + (size_t)r * dst_us_lb, 128, (dst_w + 1) & ~1u);
-                    }
-
                     const uint8_t *src_uv2 = src->uv_plane
                         ? src->uv_plane
                         : (src->y_plane + (size_t)src_stride * src->height);
                     uint8_t *sub_y = dst_y + (size_t)off_y_lb * dst_stride + off_x;
 
                     /* Fix V4.8.2: apply the same source rotation here that the
-                     * zoom-in / 1x path applies in Fix1. The letterbox path used to
-                     * jump straight to inject_done, skipping Fix1, so the zoomed-out
-                     * frame was scaled WITHOUT rotation while 1x/zoom-in applied it
-                     * → pressing zoom-out made the frame appear to rotate. Rotate the
-                     * full source into a temp NV12 buffer, then letterbox-scale it. */
+                     * zoom-in / 1x path applies in Fix1. Rotate the full source
+                     * into a temp NV12 buffer, then letterbox-scale it. */
                     const uint8_t *rot_y  = eff_y;
                     const uint8_t *rot_uv = src_uv2;
                     int   rot_stride     = src_stride;
@@ -867,57 +1632,129 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                         eff_y, src_uv2, src_stride, src_w, src_h,
                         rot_buf_lb, rot_y, rot_uv, rot_stride, rot_w, rot_h);
 
-                    if (dst_uv_lb) {
-                        uint8_t *sub_uv = dst_uv_lb + (size_t)(off_y_lb / 2) * dst_us_lb + off_x;
-                        libyuv::NV12Scale(rot_y, rot_stride, rot_uv, rot_stride,
-                                          rot_w, rot_h,
-                                          sub_y, dst_stride, sub_uv, dst_us_lb,
-                                          scaled_w, scaled_h,
-                                          libyuv::kFilterLinear);
-                    } else {
-                        /* Y-only fallback */
-                        for (int r = 0; r < scaled_h; r++) {
-                            uint8_t *row_dst = sub_y + (size_t)r * dst_stride;
-                            int src_r = r * rot_h / scaled_h;
-                            if (src_r >= rot_h) src_r = rot_h - 1;
-                            memcpy(row_dst, rot_y + (size_t)src_r * rot_stride,
-                                   (size_t)scaled_w);
+                    int uv_w = (rot_w + 1) / 2, uv_h = (rot_h + 1) / 2;
+                    std::vector<uint8_t> tmp_u((size_t)uv_w * uv_h), tmp_v((size_t)uv_w * uv_h);
+                    for (int y = 0; y < uv_h; y++) {
+                        const uint8_t *row = rot_uv + (size_t)y * rot_stride;
+                        uint8_t *ru = tmp_u.data() + (size_t)y * uv_w;
+                        uint8_t *rv = tmp_v.data() + (size_t)y * uv_w;
+                        for (int x = 0; x < uv_w; x++) {
+                            ru[x] = row[x * 2];
+                            rv[x] = row[x * 2 + 1];
                         }
                     }
-                    LOGD("inject_yuv: zoom-out letterbox scale_q16=%u scaled=%dx%d off=(%d,%d) rot=%u",
-                         ov_scale, scaled_w, scaled_h, off_x, off_y_lb, rot_lb);
+                    if (is_planar && dst_u && dst_v && role == STREAM_ROLE_VIDEO) {
+                        /* [V26 gray fix] the MTK A14 HW encoder reads the FIRST
+                         * chroma region as interleaved Cb/Cr even when lockPlanes
+                         * reports a flex 3-plane layout — the pre-V26 flex write
+                         * left it interpreting V-plane bytes as UV pairs => the
+                         * grayscale recordings in the V25 retest.  Same fix the
+                         * non-letterbox VIDEO path has shipped since V17. */
+                        uint8_t *semi = (dst_u < dst_v) ? dst_u : dst_v;
+                        for (uint32_t r = 0; r < dst_h / 2; r++)
+                            memset(semi + (size_t)r * dst_stride, 128, dst_w & ~1u);
+                        int chw = ((int)dst_w + 1) / 2, chh = ((int)dst_h + 1) / 2;
+                        std::vector<uint8_t> su2((size_t)chw * chh), sv2((size_t)chw * chh);
+                        libyuv::I420Scale(rot_y, rot_stride,
+                                          tmp_u.data(), uv_w, tmp_v.data(), uv_w,
+                                          rot_w, rot_h,
+                                          sub_y, dst_stride,
+                                          su2.data(), chw, sv2.data(), chw,
+                                          scaled_w, scaled_h, filt);
+                        for (int y = 0; y < scaled_h / 2; y++) {
+                            uint8_t *drow = semi + ((size_t)(off_y_lb / 2) + y) * dst_stride + off_x;
+                            const uint8_t *ru = su2.data() + (size_t)y * chw;
+                            const uint8_t *rv = sv2.data() + (size_t)y * chw;
+                            for (int x = 0; x < scaled_w / 2; x++) {
+                                drow[x * 2]     = ru[x];
+                                drow[x * 2 + 1] = rv[x];
+                            }
+                        }
+                    } else if (is_planar && dst_u && dst_v) {
+                        for (uint32_t r = 0; r < dst_h / 2; r++) {
+                            memset(dst_u + (size_t)r * du_stride, 128, (dst_w + 1) / 2);
+                            memset(dst_v + (size_t)r * dv_stride, 128, (dst_w + 1) / 2);
+                        }
+                        uint8_t *sub_u = dst_u + (size_t)(off_y_lb / 2) * du_stride + (off_x / 2);
+                        uint8_t *sub_v = dst_v + (size_t)(off_y_lb / 2) * dv_stride + (off_x / 2);
+                        libyuv::I420Scale(rot_y, rot_stride,
+                                          tmp_u.data(), uv_w, tmp_v.data(), uv_w,
+                                          rot_w, rot_h,
+                                          sub_y, dst_stride,
+                                          sub_u, du_stride, sub_v, dv_stride,
+                                          scaled_w, scaled_h, filt);
+                    } else if (dst_uv && dst_uv_stride > 0) {
+                        for (uint32_t r = 0; r < dst_h / 2; r++)
+                            memset(dst_uv + (size_t)r * dst_uv_stride, 128, (dst_w + 1) & ~1u);
+
+                        uint8_t *sub_uv = dst_uv + (size_t)(off_y_lb / 2) * dst_uv_stride + off_x;
+                        if (is_nv21) {
+                            size_t scaled_uv_rows = ((size_t)scaled_h + 1) / 2;
+                            std::vector<uint8_t> tmp_uv((size_t)dst_uv_stride * scaled_uv_rows);
+                            libyuv::NV12Scale(rot_y, rot_stride, rot_uv, rot_stride,
+                                              rot_w, rot_h,
+                                              sub_y, dst_stride, tmp_uv.data(), dst_uv_stride,
+                                              scaled_w, scaled_h, filt);
+                            for (size_t r = 0; r < scaled_uv_rows; r++) {
+                                const uint8_t *srow = tmp_uv.data() + r * dst_uv_stride;
+                                uint8_t *drow = sub_uv + r * (size_t)dst_uv_stride;
+                                size_t cols = (size_t)((scaled_w + 1) / 2) * 2;
+                                for (size_t c = 0; c + 1 < cols; c += 2) {
+                                    drow[c]     = srow[c + 1];
+                                    drow[c + 1] = srow[c];
+                                }
+                            }
+                        } else {
+                            libyuv::NV12Scale(rot_y, rot_stride, rot_uv, rot_stride,
+                                              rot_w, rot_h,
+                                              sub_y, dst_stride, sub_uv, dst_uv_stride,
+                                              scaled_w, scaled_h, filt);
+                        }
+                    }
+                    LOGD("inject_yuv: zoom-out letterbox scale_q16=%u scaled=%dx%d off=(%d,%d) rot=%u is_nv21=%d is_planar=%d",
+                         ov_scale, scaled_w, scaled_h, off_x, off_y_lb, rot_lb, (int)is_nv21, (int)is_planar);
                 }
+                /* [V26] cache the finished destination image for replay. */
+                conv_cache_store(role, dst_y, dst_u, dst_v, dst_uv, dst_stride,
+                                 du_stride, dv_stride, dst_uv_stride,
+                                 dst_w, dst_h, is_planar, is_nv21);
+
                 /* Unlock the outer lock before returning — this was the root cause
                  * of the "real camera on zoom-out" bug (buffer left locked). */
                 g_unlock(hwb, nullptr);
-                goto inject_done;
+                return true;
             }
         }
 
 
         /* Fix1: Apply source rotation written by frame_producer into the ring header.
-         * Rotates the source NV12 plane pointers using a temp heap buffer and
-         * libyuv I420Rotate so the content is right-way-up before libyuv scaling. */
+         * V5 REWRITE: avoid rot_buf.insert reallocation that invalidated pointers and
+         * could cause right-side striped artifact. Use separate final NV12 buffer. */
         std::vector<uint8_t> rot_buf;
+        /* [V57b] when source rotation is applied the rotated frame is kept as
+         * I420 directly (fused NV12ToI420Rotate) — planar write paths consume
+         * these planes and skip the NV12 deinterleave; the semi-planar path
+         * merges U/V on demand. */
+        bool post_rot_i420 = false;
+        const uint8_t *rot_u_ptr = nullptr;
+        const uint8_t *rot_v_ptr = nullptr;
+        int rot_uv_stride = 0;
         {
+            /* [V10 ROT0] honor total==0 (upright); the legacy 180° first-frame
+             * fallback flipped already-upright static media upside-down. */
             uint32_t src_rot = frame_source_get_total_rotation();
-            /* Fallback ONLY for the first-frame race: if NO frame has been written
-             * to the ring yet AND neither source nor manual rotation has been set,
-             * the IPC rotation may not have arrived yet → default to 180°.
-             *
-             * IMPORTANT: do NOT fall back when total==0 from a VALID combination of
-             * source+manual rotation. total==0 is the upright/identity orientation
-             * (e.g. source_rotation=270 + manual_rotation=90 = 360 % 360 = 0). The old
-             * `if (src_rot==0) src_rot=180` turned that upright position into 180°
-             * (upside-down), which is exactly why pressing rotate never reached
-             * upright. Only fall back if the ring has no frame yet AND rotation was
-             * never set. */
-            if (src_rot == 0 &&
-                frame_source_get_rotation() == 0 &&
-                frame_source_get_manual_rotation() == 0 &&
-                !frame_source_ready()) {
-                src_rot = 180u;
-                LOGI("inject_yuv: Fix1 fallback: IPC src_rot=0 (no frame yet) → applying 180° default");
+            /* [V19 rot] MTK encoders tag the recording with their own rotation
+             * metadata; baking the overlay rotation into the buffer double-
+             * rotates the recorded video (sideways, 14.mediatek.5). */
+            if (role == STREAM_ROLE_VIDEO && !platform_is_unisoc() && !platform_is_qcom()) {
+                /* [V21 rot] V19/V20 shipped rot=0 -> portrait pixels squashed into
+                 * the 720p recording and the MTK player's 90CW metadata tipped the
+                 * result sideways (14.mediatek.6 screenshot: head at right). The
+                 * encoder tags 90CW, so pre-rotate pixels 90CCW (=270) when a
+                 * portrait source meets a landscape recording: upright after the
+                 * player metadata, and no more aspect squash. Manual 90/270
+                 * totals (user overlay) are honored untouched. */
+                if ((src_rot % 180) == 0 && src_h > src_w && dst_w > dst_h) src_rot = 270;
             }
             if (src_rot == 90 || src_rot == 180 || src_rot == 270) {
                 libyuv::RotationMode rot_mode =
@@ -925,61 +1762,51 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                     (src_rot == 270) ? libyuv::kRotate270 : libyuv::kRotate180;
 
                 int pre_w = src_w, pre_h = src_h;
-                int post_w = (src_rot == 90 || src_rot == 270) ? pre_h : pre_w;  /* 90/270 swap dims */
+                int post_w = (src_rot == 90 || src_rot == 270) ? pre_h : pre_w;
                 int post_h = (src_rot == 90 || src_rot == 270) ? pre_w : pre_h;
                 post_w = (post_w + 1) & ~1;
                 post_h = (post_h + 1) & ~1;
 
-                /* Temp I420 buffers: pre-rotation (src) and post-rotation (dst) */
-                int uv_w = (pre_w + 1) / 2, uv_h = (pre_h + 1) / 2;
                 int r_uv_w = (post_w + 1) / 2, r_uv_h = (post_h + 1) / 2;
-                size_t src_i420_sz = (size_t)pre_w * pre_h + (size_t)uv_w * uv_h * 2;
-                size_t dst_i420_sz = (size_t)post_w * post_h + (size_t)r_uv_w * r_uv_h * 2;
-                rot_buf.resize(src_i420_sz + dst_i420_sz);
+                /* [V57 SPEED] single-pass NV12Rotate replaces the old
+                 * NV12ToI420 -> I420Rotate -> I420ToNV12 triple: three
+                 * full-frame passes removed per video frame. On the mt6765
+                 * (8×A53) the old chain cost ~40 ms/frame extra — the direct
+                 * cause of the "video is slow" complaint on CPH2387. */
+                size_t i420_rot_sz = (size_t)post_w * post_h
+                                   + 2 * (size_t)r_uv_w * r_uv_h;
+                rot_buf.resize(i420_rot_sz);
 
-                uint8_t *si_y = rot_buf.data();
-                uint8_t *si_u = si_y + (size_t)pre_w * pre_h;
-                uint8_t *si_v = si_u + (size_t)uv_w * uv_h;
-                uint8_t *ri_y = rot_buf.data() + src_i420_sz;
+                uint8_t *ri_y = rot_buf.data();
                 uint8_t *ri_u = ri_y + (size_t)post_w * post_h;
                 uint8_t *ri_v = ri_u + (size_t)r_uv_w * r_uv_h;
 
-                /* NV12→I420 of the (possibly cropped) effective source */
                 const uint8_t *uv = eff_uv ? eff_uv : (eff_y + (size_t)src_stride * src_h);
-                libyuv::NV12ToI420(eff_y, src_stride,
-                                   uv,   src_stride,
-                                   si_y, pre_w,
-                                   si_u, uv_w,
-                                   si_v, uv_w,
-                                   pre_w, pre_h);
-
-                libyuv::I420Rotate(si_y, pre_w, si_u, uv_w, si_v, uv_w,
-                                   ri_y, post_w, ri_u, r_uv_w, ri_v, r_uv_w,
-                                   pre_w, pre_h, rot_mode);
-
-                /* Point eff_y / eff_uv at the rotated I420; build a packed NV12 uv */
-                /* For simplicity keep as I420 — override eff_y/uv and mark planar */
+                // V5: ensure we don't read beyond src bounds — clamp src_w/h to stride
+                int safe_pre_w = std::min(pre_w, src_stride);
+                if (safe_pre_w != pre_w) {
+                    LOGW("inject_yuv: Fix1 clamping pre_w %d -> %d to match stride %d", pre_w, safe_pre_w, src_stride);
+                    pre_w = safe_pre_w;
+                }
+                pre_w &= ~1; pre_h &= ~1;   // rotation needs even dims
+                libyuv::NV12ToI420Rotate(eff_y, src_stride,
+                                         uv,    src_stride,
+                                         ri_y,  post_w,
+                                         ri_u,  r_uv_w,
+                                         ri_v,  r_uv_w,
+                                         pre_w, pre_h, rot_mode);
                 eff_y    = ri_y;
-                eff_uv   = nullptr;   /* signal planar below */
+                eff_uv   = ri_u;   // non-null; NV12 consumers gated on post_rot_i420
+                post_rot_i420 = true;
+                rot_u_ptr = ri_u;
+                rot_v_ptr = ri_v;
+                rot_uv_stride = r_uv_w;
                 src_w    = post_w;
                 src_h    = post_h;
                 src_stride = post_w;
-
-                /* We'll re-pack into NV12 now so the existing semiplanar path works */
-                size_t nv12_sz = (size_t)post_w * post_h + (size_t)post_w * ((post_h + 1)/2);
-                std::vector<uint8_t> nv12_tmp(nv12_sz);
-                uint8_t *nv12_y  = nv12_tmp.data();
-                uint8_t *nv12_uv = nv12_y + (size_t)post_w * post_h;
-                libyuv::I420ToNV12(ri_y, post_w, ri_u, r_uv_w, ri_v, r_uv_w,
-                                   nv12_y, post_w, nv12_uv, post_w,
-                                   post_w, post_h);
-                rot_buf.insert(rot_buf.end(), nv12_tmp.begin(), nv12_tmp.end());
-                eff_y    = rot_buf.data() + src_i420_sz + dst_i420_sz;
-                eff_uv   = eff_y + (size_t)post_w * post_h;
-                src_stride = post_w;
-                LOGI("inject_yuv: Fix1 V478R5 source_rotation=%u applied %dx%d->%dx%d swap=%d",
+                LOGI("inject_yuv: Fix1 V57b source_rotation=%u applied %dx%d->%dx%d swap=%d final_buf=%p [NV12ToI420Rotate fused]",
                      src_rot, pre_w, pre_h, post_w, post_h,
-                     (int)(src_rot == 90 || src_rot == 270));
+                     (int)(src_rot == 90 || src_rot == 270), (void*)eff_y);
 
                 /* Fix3: center-crop rotated portrait to match destination AR.
                  * After 90°/270°: src is 720×1280 portrait, dst is 640×480 landscape.
@@ -1006,7 +1833,14 @@ static bool inject_yuv(AHardwareBuffer *hwb,
                             int off_x2 = ((src_w - crop_w2) / 2) & ~1;
                             int off_y2 = ((src_h - crop_h2) / 2) & ~1;
                             eff_y  += (size_t)off_y2 * src_stride + off_x2;
-                            eff_uv += (size_t)(off_y2 / 2) * src_stride + off_x2;
+                            if (post_rot_i420) {
+                                size_t uoff = (size_t)(off_y2 / 2) * rot_uv_stride
+                                            + (size_t)(off_x2 / 2);
+                                rot_u_ptr += uoff;
+                                rot_v_ptr += uoff;
+                            } else {
+                                eff_uv += (size_t)(off_y2 / 2) * src_stride + off_x2;
+                            }
                             LOGD("inject_yuv: Fix3 AR-crop rot=%u "
                                  "(%dx%d)→(%dx%d) off=(%d,%d) dst=%ux%u",
                                  src_rot, src_w, src_h, crop_w2, crop_h2,
@@ -1019,176 +1853,203 @@ static bool inject_yuv(AHardwareBuffer *hwb,
             }
         }
 
-        bool is_semiplanar = false, is_planar = false;
-        switch (actual_format) {
-            case HAL_PIXEL_FORMAT_YCBCR_420_888:
-            case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-            case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED:
-                if (planes.planeCount >= 3) {
-                    if (planes.planes[1].pixelStride == 1) {
-                        is_planar = true;
-                    } else if (planes.planes[1].pixelStride == 2) {
-                        is_semiplanar = true;
-                    } else {
-                        LOGW("inject_yuv: unexpected pixelStride=%u, defaulting to semiplanar",
-                             planes.planes[1].pixelStride);
-                        is_semiplanar = true;
-                    }
-                } else if (planes.planeCount == 2) {
-                    is_semiplanar = true;
-                }
-                break;
-            case HAL_PIXEL_FORMAT_YCBCR_P010:
-                LOGW("inject_yuv: P010 not supported, skipping");
-                g_unlock(hwb, nullptr);
-                return false;
-            case HAL_PIXEL_FORMAT_YV12:
-                /* Planar YCrCb 4:2:0 — planes[1]=V, planes[2]=U, pixelStride=1.
-                 * Previously fell into `default` → treated as semi-planar NV12,
-                 * which wrote chroma to the wrong plane on video/record streams. */
-                if (planes.planeCount >= 3 && planes.planes[1].pixelStride == 1) {
-                    is_planar = true;
-                } else {
-                    is_semiplanar = (planes.planeCount >= 2);
-                }
-                break;
-            default:
-                is_semiplanar = (planes.planeCount >= 2);
-                break;
-        }
 
-        LOGD("inject_yuv: is_semiplanar=%d is_planar=%d planeCount=%u",
-             (int)is_semiplanar, (int)is_planar, planes.planeCount);
 
         bool ok = false;
-        if (is_semiplanar && planes.planeCount >= 2) {
-            bool is_nv21 = (planes.planeCount >= 3) &&
-                           ((uintptr_t)planes.planes[1].data & 1u) &&
-                           ((uintptr_t)planes.planes[2].data < (uintptr_t)planes.planes[1].data);
-
-            LOGD("inject_yuv: NV21 detect: p1=%p p2=%p is_nv21=%d",
-                 planes.planes[1].data,
-                 planes.planeCount >= 3 ? planes.planes[2].data : nullptr,
-                 (int)is_nv21);
-
-            if (is_nv21) {
-                uint8_t *uv_base      = (uint8_t *)planes.planes[2].data;
-                int      dst_uv_stride = (int)planes.planes[2].rowStride;
-                if (!uv_base || dst_uv_stride <= 0) {
-                    LOGE("inject_yuv: NV21 plane[2] invalid data=%p stride=%d",
-                         (void *)uv_base, dst_uv_stride);
-                    g_unlock(hwb, nullptr);
-                    return false;
+        if (is_planar && dst_u && dst_v) {
+            int uv_w = (src_w + 1) / 2, uv_h = (src_h + 1) / 2;
+            std::vector<uint8_t> tmp_u, tmp_v;
+            const uint8_t *pu; const uint8_t *pv; int pu_stride;
+            if (post_rot_i420) {
+                /* [V57b] rotated source is already I420 — planes used
+                 * directly; the deinterleave loop is skipped entirely. */
+                pu = rot_u_ptr; pv = rot_v_ptr; pu_stride = rot_uv_stride;
+            } else {
+                tmp_u.assign((size_t)uv_w * uv_h, 0);
+                tmp_v.assign((size_t)uv_w * uv_h, 0);
+                const uint8_t *suv = eff_uv ? eff_uv : (eff_y + (size_t)src_stride * src_h);
+                for (int y = 0; y < uv_h; y++) {
+                    const uint8_t *row = suv + (size_t)y * src_stride;
+                    uint8_t *ru = tmp_u.data() + (size_t)y * uv_w;
+                    uint8_t *rv = tmp_v.data() + (size_t)y * uv_w;
+                    for (int x = 0; x < uv_w; x++) {
+                        ru[x] = row[x * 2];
+                        rv[x] = row[x * 2 + 1];
+                    }
                 }
-
+                pu = tmp_u.data(); pv = tmp_v.data(); pu_stride = uv_w;
+            }
+            if (role == STREAM_ROLE_VIDEO) {
+                /* [V17 MTK-A14 gray-video fix] The HW encoder ignores the flex
+                 * plane pointers and reads the FIRST chroma region as
+                 * interleaved Cb/Cr pairs (semi-planar). Contiguous planar
+                 * writes there give Cb==Cr -> grayscale recordings
+                 * (14.mediatek.4 screenshot). Interleave NV12-style into the
+                 * first chroma region instead; preview-mode YV12 (role=1)
+                 * keeps the contiguous flex layout that renders correctly. */
+                int chw = ((int)dst_w + 1) / 2, chh = ((int)dst_h + 1) / 2;
+                std::vector<uint8_t> su2((size_t)chw * chh), sv2((size_t)chw * chh);
+                libyuv::I420Scale(eff_y, src_stride,
+                                  pu, pu_stride, pv, pu_stride,
+                                  src_w, src_h,
+                                  dst_y, dst_stride,
+                                  su2.data(), chw, sv2.data(), chw,
+                                  (int)dst_w, (int)dst_h, filt);
+                /* [V20 crash revert] V19 wrote NV12 (w*h/2) into the HIGHER
+                 * chroma region — but that region is only w*h/4 bytes, so the
+                 * loop ran off the mapped buffer (cameraserver SIGSEGV,
+                 * 14.mediatek.1 tombstone_00). R1+R2 are contiguous, so the
+                 * V18 layout (NV12 across both, starting at the lower region)
+                 * is the only provably in-bounds placement. */
+                uint8_t *semi = (dst_u < dst_v) ? dst_u : dst_v;  // R1 (safe)
+                /* [V57 diag] PERIODIC buffer layout dump (every 300th frame —
+                 * the V20 one-shot fired before the log-upload window and was
+                 * lost). Compares lockPlanes chroma offsets against the spec
+                 * YV12 layout (Y, then V, then U with ALIGN16 strides) so the
+                 * gray-video mystery is solved with measured offsets. */
+                static int layout_count = 0;
+                if ((layout_count++ % 300) == 0) {
+                    long alloc_sz = (dmabuf_fd >= 0) ? (long)lseek(dmabuf_fd, 0, SEEK_END) : -1;
+                    uint32_t y_stride_spec = ((dst_w + 15u) & ~15u);
+                    uint32_t c_stride_spec = (((y_stride_spec / 2u) + 15u) & ~15u);
+                    long spec_v_off = (long)y_stride_spec * dst_h;
+                    long spec_u_off = spec_v_off + (long)c_stride_spec * ((dst_h + 1) / 2);
+                    LOGI("inject_yuv: [V57 layout] dst=%ux%u stride=%u y=%p u=%p v=%p "
+                         "u_off=%ld v_off=%ld du_stride=%d dv_stride=%d alloc=%ld "
+                         "nominal_chroma_off=%u spec_v_off=%ld spec_u_off=%ld",
+                         dst_w, dst_h, dst_stride, (void *)dst_y, (void *)dst_u, (void *)dst_v,
+                         (long)(dst_u - dst_y), (long)(dst_v - dst_y),
+                         du_stride, dv_stride, alloc_sz,
+                         dst_stride * dst_h, spec_v_off, spec_u_off);
+                }
+                for (int y = 0; y < chh; y++) {
+                    uint8_t *drow = semi + (size_t)y * dst_stride;
+                    const uint8_t *ru = su2.data() + (size_t)y * chw;
+                    const uint8_t *rv = sv2.data() + (size_t)y * chw;
+                    for (int x = 0; x < chw; x++) {
+                        drow[x * 2]     = ru[x];
+                        drow[x * 2 + 1] = rv[x];
+                    }
+                }
+                ok = true;
+                LOGI("inject_yuv: Planar VIDEO interleave+fast-scale OK (%dx%d → %ux%u)",
+                     src_w, src_h, dst_w, dst_h);
+            } else {
+                /* [V57 diag] periodic preview-planar layout dump — the gray
+                 * PREVIEW mystery: are dst_u/dst_v (lockPlanes) where the
+                 * display actually reads chroma? Compare with spec offsets. */
+                static int pv_layout_count = 0;
+                if ((pv_layout_count++ % 300) == 0) {
+                    long pv_alloc = (dmabuf_fd >= 0) ? (long)lseek(dmabuf_fd, 0, SEEK_END) : -1;
+                    uint32_t y_stride_spec = ((dst_w + 15u) & ~15u);
+                    uint32_t c_stride_spec = (((y_stride_spec / 2u) + 15u) & ~15u);
+                    LOGI("inject_yuv: [V57 pv-layout] dst=%ux%u y=%p u_off=%ld v_off=%ld "
+                         "du=%d dv=%d spec_v_off=%ld spec_u_off=%ld alloc=%ld",
+                         dst_w, dst_h, (void *)dst_y,
+                         (long)(dst_u - dst_y), (long)(dst_v - dst_y),
+                         du_stride, dv_stride,
+                         (long)y_stride_spec * dst_h,
+                         (long)y_stride_spec * dst_h + (long)c_stride_spec * ((dst_h + 1) / 2),
+                         pv_alloc);
+                }
+                libyuv::I420Scale(eff_y, src_stride,
+                                  pu, pu_stride,
+                                  pv, pu_stride,
+                                  src_w, src_h,
+                                  dst_y, dst_stride,
+                                  dst_u, du_stride,
+                                  dst_v, dv_stride,
+                                  (int)dst_w, (int)dst_h,
+                                  filt);
+                ok = true;
+                LOGD("inject_yuv: Planar I420/YV12 scale OK (%dx%d → %ux%u)", src_w, src_h, dst_w, dst_h);
+            }
+        } else if (dst_uv && dst_uv_stride > 0) {
+            const uint8_t *src_uv = eff_uv ? eff_uv : (eff_y + (size_t)src_stride * src_h);
+            int src_uv_stride = src_stride;
+            std::vector<uint8_t> rot_uv_buf;
+            if (post_rot_i420) {
+                /* [V57b] semi-planar dst needs interleaved UV: merge the
+                 * rotated I420 planes (only rotated frames land here). */
+                rot_uv_buf.assign((size_t)src_w * ((src_h + 1) / 2), 0);
+                libyuv::MergeUVPlane(rot_u_ptr, rot_uv_stride,
+                                     rot_v_ptr, rot_uv_stride,
+                                     rot_uv_buf.data(), src_w,
+                                     (src_w + 1) / 2, (src_h + 1) / 2);
+                src_uv = rot_uv_buf.data();
+                src_uv_stride = src_w;
+            }
+            if (is_nv21) {
                 size_t uv_rows    = ((size_t)dst_h + 1) / 2;
                 size_t tmp_stride = (size_t)dst_uv_stride;
                 std::vector<uint8_t> tmp_uv(tmp_stride * uv_rows);
 
-                const uint8_t *src_uv = eff_uv;
-                std::vector<uint8_t> src_uv_vec;
-                if (!src_uv) {
-                    int uv_w = (src_w + 1) / 2, uv_h = (src_h + 1) / 2;
-                    src_uv_vec.resize((size_t)uv_w * uv_h * 2);
-                    const uint8_t *su = src->y_plane + (size_t)src_stride * src_h;
-                    const uint8_t *sv = su + (size_t)uv_w * uv_h;
-                    for (int y = 0; y < uv_h; y++)
-                        for (int x = 0; x < uv_w; x++) {
-                            src_uv_vec[y * uv_w * 2 + x * 2]     = su[y * uv_w + x];
-                            src_uv_vec[y * uv_w * 2 + x * 2 + 1] = sv[y * uv_w + x];
-                        }
-                    src_uv = src_uv_vec.data();
-                }
-
-                libyuv::NV12Scale(eff_y, src_stride, src_uv, src_stride,
+                libyuv::NV12Scale(eff_y, src_stride, src_uv, src_uv_stride,
                                   src_w, src_h,
                                   dst_y, dst_stride, tmp_uv.data(), (int)tmp_stride,
-                                  (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
+                                  (int)dst_w, (int)dst_h, filt);
 
                 for (size_t r = 0; r < uv_rows; r++) {
-                    uint8_t *srow = tmp_uv.data() + r * tmp_stride;
-                    uint8_t *drow = uv_base       + r * (size_t)dst_uv_stride;
-                    size_t   cols = (size_t)((dst_w + 1) / 2) * 2;
+                    const uint8_t *srow = tmp_uv.data() + r * tmp_stride;
+                    uint8_t *drow = dst_uv + r * (size_t)dst_uv_stride;
+                    size_t cols = (size_t)((dst_w + 1) / 2) * 2;
                     for (size_t c = 0; c + 1 < cols; c += 2) {
-                        drow[c]     = srow[c + 1];
-                        drow[c + 1] = srow[c];
+                        drow[c]     = srow[c + 1]; // V (from NV12's V)
+                        drow[c + 1] = srow[c];     // U (from NV12's U)
                     }
                 }
-                /* stream_rotation not applied here: the source_rotation (Fix1 above)
-                 * already handles orientation. Applying buf->stream->rotation on top
-                 * causes stride/dimension mismatch and distortion for 90°/270° streams. */
                 ok = true;
                 LOGD("inject_yuv: NV21 scale+swap OK (%dx%d → %ux%u)", src_w, src_h, dst_w, dst_h);
             } else {
-                uint8_t *dst_uv   = (uint8_t *)planes.planes[1].data;
-                int dst_uv_stride = (int)planes.planes[1].rowStride;
-                if (!dst_uv || dst_uv_stride <= 0) {
-                    LOGE("inject_yuv: UV plane invalid data=%p stride=%d", (void *)dst_uv, dst_uv_stride);
-                    g_unlock(hwb, nullptr);
-                    return false;
-                }
-                if (src->uv_plane) {
-                    libyuv::NV12Scale(eff_y, src_stride, eff_uv, src_stride,
-                                      src_w, src_h,
-                                      dst_y, dst_stride, dst_uv, dst_uv_stride,
-                                      (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
-                } else {
-                    int uv_w = (src_w + 1) / 2, uv_h = (src_h + 1) / 2;
-                    std::vector<uint8_t> tmp_uv((size_t)uv_w * uv_h * 2);
-                    const uint8_t *su = src->y_plane + (size_t)src_stride * src_h;
-                    const uint8_t *sv = su + (size_t)uv_w * uv_h;
-                    for (int y = 0; y < uv_h; y++)
-                        for (int x = 0; x < uv_w; x++) {
-                            tmp_uv[y * uv_w * 2 + x * 2]     = su[y * uv_w + x];
-                            tmp_uv[y * uv_w * 2 + x * 2 + 1] = sv[y * uv_w + x];
-                        }
-                    libyuv::NV12Scale(eff_y, src_stride, tmp_uv.data(), uv_w * 2,
-                                      src_w, src_h,
-                                      dst_y, dst_stride, dst_uv, dst_uv_stride,
-                                      (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
-                }
-                /* stream_rotation not applied here: source_rotation (Fix1) covers this.
-                 * Applying stream_rotation after NV12Scale uses wrong stride for 90°/270°. */
+                libyuv::NV12Scale(eff_y, src_stride, src_uv, src_uv_stride,
+                                  src_w, src_h,
+                                  dst_y, dst_stride, dst_uv, dst_uv_stride,
+                                  (int)dst_w, (int)dst_h, filt);
                 ok = true;
                 LOGD("inject_yuv: NV12 scale OK (%dx%d → %ux%u)", src_w, src_h, dst_w, dst_h);
             }
-
-        } else if (is_planar && planes.planeCount >= 3) {
-            uint8_t *dst_u = (uint8_t *)planes.planes[1].data;
-            uint8_t *dst_v = (uint8_t *)planes.planes[2].data;
-            int du_stride  = (int)planes.planes[1].rowStride;
-            int dv_stride  = (int)planes.planes[2].rowStride;
-            if (!dst_u || !dst_v || du_stride <= 0 || dv_stride <= 0) {
-                LOGE("inject_yuv: I420 planes invalid u=%p v=%p us=%d vs=%d",
-                     (void *)dst_u, (void *)dst_v, du_stride, dv_stride);
-                g_unlock(hwb, nullptr);
-                return false;
-            }
-            int uv_w = (src_w + 1) / 2, uv_h = (src_h + 1) / 2;
-            if (eff_uv) {
-                std::vector<uint8_t> tmp_u((size_t)uv_w * uv_h), tmp_v((size_t)uv_w * uv_h);
-                for (int y = 0; y < uv_h; y++)
-                    for (int x = 0; x < uv_w; x++) {
-                        tmp_u[y * uv_w + x] = eff_uv[y * src_stride + x * 2];
-                        tmp_v[y * uv_w + x] = eff_uv[y * src_stride + x * 2 + 1];
-                    }
-                libyuv::I420Scale(eff_y, src_stride, tmp_u.data(), uv_w, tmp_v.data(), uv_w,
-                                  src_w, src_h,
-                                  dst_y, dst_stride, dst_u, du_stride, dst_v, dv_stride,
-                                  (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
-            } else {
-                const uint8_t *su = src->y_plane + (size_t)src_stride * orig_src_h;
-                const uint8_t *sv = su + (size_t)uv_w * uv_h;
-                libyuv::I420Scale(eff_y, src_stride, su, uv_w, sv, uv_w,
-                                  src_w, src_h,
-                                  dst_y, dst_stride, dst_u, du_stride, dst_v, dv_stride,
-                                  (int)dst_w, (int)dst_h, libyuv::kFilterLinear);
-            }
-            ok = true;
-            LOGD("inject_yuv: I420 scale OK (%dx%d → %ux%u)", src_w, src_h, dst_w, dst_h);
         } else {
-            LOGE("inject_yuv: unexpected planeCount=%u for fmt=0x%x — cannot inject",
+            LOGE("inject_yuv: unable to resolve UV destination pointer (planes=%u fmt=0x%x)",
                  planes.planeCount, actual_format);
+        }
+
+        // [V10 SHARP] sharpen upscaled destinations (FaceTec 1920x1080 from the
+        // ~816-wide ring) so the injected selfie no longer looks soft.
+        if (ok && dst_y && src_w > 0 && (int)dst_w > src_w * 7 / 5) {
+            sharpen_y_plane(dst_y, dst_stride, (int)dst_w, (int)dst_h);
+            LOGD("inject_yuv: V10 sharpen applied (%dx%d -> %ux%u)", src_w, src_h, dst_w, dst_h);
+        }
+
+        // V5: clear right/bottom padding that would show as striped artifact
+        // If dst_stride > dst_w, the HAL may display the full stride width, leaving
+        // garbage on the right edge (exactly what screenshot shows). Clear it to black.
+        if (ok && dst_y && dst_stride > (int)dst_w) {
+            for (uint32_t r = 0; r < dst_h; r++) {
+                memset(dst_y + (size_t)r * dst_stride + dst_w, 16, (size_t)(dst_stride - dst_w));
+            }
+            LOGD("inject_yuv: V5 cleared Y padding stride=%d w=%u", dst_stride, dst_w);
+        }
+        if (ok && dst_uv && dst_uv_stride > (int)dst_w) {
+            uint32_t uv_rows = (dst_h + 1) / 2;
+            for (uint32_t r = 0; r < uv_rows; r++) {
+                memset(dst_uv + (size_t)r * dst_uv_stride + dst_w, 128, (size_t)(dst_uv_stride - dst_w));
+            }
+            LOGD("inject_yuv: V5 cleared UV padding stride=%d w=%u", dst_uv_stride, dst_w);
+        }
+        if (ok && is_planar && dst_u && dst_v) {
+            if (du_stride > (int)((dst_w + 1) / 2)) {
+                for (uint32_t r = 0; r < dst_h / 2; r++) {
+                    memset(dst_u + (size_t)r * du_stride + (dst_w + 1) / 2, 128, (size_t)(du_stride - (dst_w + 1) / 2));
+                    memset(dst_v + (size_t)r * dv_stride + (dst_w + 1) / 2, 128, (size_t)(dv_stride - (dst_w + 1) / 2));
+                }
+            }
+        }
+
+        if (ok) {
+            /* [V26] cache the finished destination image for replay. */
+            conv_cache_store(role, dst_y, dst_u, dst_v, dst_uv, dst_stride,
+                             du_stride, dv_stride, dst_uv_stride,
+                             dst_w, dst_h, is_planar, is_nv21);
         }
 
         if (ok && dmabuf_fd >= 0) {
@@ -1232,7 +2093,7 @@ static bool inject_yuv(AHardwareBuffer *hwb,
          * (CPU-written) region on its next access.  Without this, the display
          * and encoder always show the original camera frame despite a
          * successful CPU write. */
-        if (ok && g_lock) {
+        if (ok && g_lock && platform_is_qcom()) {
             void *ubwc_touch = nullptr;
             int touch_rc = g_lock(hwb,
                                   AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
@@ -1265,22 +2126,21 @@ static bool inject_yuv(AHardwareBuffer *hwb,
         LOGE("inject_yuv: lockPlanes unavailable — cannot safely determine UV offset");
         return false;
     }
-
-inject_done:
-    /* Reached by the zoom-out letterbox path which locks/unlocks the buffer
-     * itself and needs to bypass the normal per-format scaling block. */
-    return true;
 }
 
-static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf,
+bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf,
                         const FrameData *src, int32_t fence_fd,
                         int32_t *out_release_fence,
                         int dmabuf_fd) {
-    if (!hwb || !buf || !src || !out_release_fence) return false;
+    /* [V18 photo] hwb may be null when called from the PCR hook on ROMs where
+     * the BLOB AHardwareBuffer cannot be resolved (HIDL wrapper handles) —
+     * the dmabuf mmap path then does the whole job. */
+    if (!buf || !src || !out_release_fence) return false;
+    if (!hwb && dmabuf_fd < 0) return false;
     *out_release_fence = -1;
 
-    AHardwareBuffer_Desc desc;
-    g_describe(hwb, &desc);
+    AHardwareBuffer_Desc desc = {};
+    if (hwb) g_describe(hwb, &desc);
 
 
 
@@ -1300,7 +2160,20 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
         return false;
     }
 
-    LOGD("inject_jpeg: framework_blob_size=%zu src=%dx%d stride=%d fence=%d",
+    /* [V22 PHOTO] On this Unisoc HAL the JPEG stream reports width=4160 as
+     * its "max JPEG size", but our 704x880 encode is ~46KB — every injection
+     * died at "JPEG > max". The dmabuf allocation is the REAL capacity; use
+     * it when it is larger. (Trailer placement below derives from this, so
+     * the framework finds the blob trailer at the true end of the buffer.) */
+    if (dmabuf_fd >= 0) {
+        const long fd_sz = (long)lseek(dmabuf_fd, 0, SEEK_END);
+        if (fd_sz > (long)framework_blob_size) {
+            LOGI("inject_jpeg: [V22] blob capacity from dmabuf alloc=%ld (stream width said %zu)",
+                 fd_sz, framework_blob_size);
+            framework_blob_size = (size_t)fd_sz;
+        }
+    }
+    LOGI("inject_jpeg: ENTRY framework_blob_size=%zu src=%dx%d stride=%d fence=%d (V11 snapshot trace)",
          framework_blob_size, src_w, src_h, src_stride, fence_fd);
 
     tjhandle tj = tjInitCompress();
@@ -1310,20 +2183,32 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
     }
 
 
-    int uv_w = (src_w + 1) / 2;
-    int uv_h = (src_h + 1) / 2;
+    /* [V54 zoom] encode the zoomed sub-rectangle when the app is zoomed in —
+     * zero-copy crop: shift the plane origins, keep strides, shrink w/h. */
+    int enc_x = 0, enc_y = 0, enc_w = src_w, enc_h = src_h;
+    const uint8_t *enc_y_plane  = src->y_plane;
+    const uint8_t *enc_uv_plane = src->uv_plane;
+    if (zoom_subrect(src_w, src_h, &enc_x, &enc_y, &enc_w, &enc_h)) {
+        enc_y_plane  = src->y_plane  + (size_t)enc_y * src_stride + enc_x;
+        enc_uv_plane = src->uv_plane + (size_t)(enc_y / 2) * src_stride + enc_x;
+        LOGI("inject_jpeg: [V54] zoom applied — encoding [%d,%d %dx%d] of %dx%d",
+             enc_x, enc_y, enc_w, enc_h, src_w, src_h);
+    }
+
+    int uv_w = (enc_w + 1) / 2;
+    int uv_h = (enc_h + 1) / 2;
     std::vector<uint8_t> u_plane((size_t)uv_w * uv_h);
     std::vector<uint8_t> v_plane((size_t)uv_w * uv_h);
 
     for (int y = 0; y < uv_h; y++) {
         for (int x = 0; x < uv_w; x++) {
-            u_plane[y * uv_w + x] = src->uv_plane[y * src_stride + x * 2];
-            v_plane[y * uv_w + x] = src->uv_plane[y * src_stride + x * 2 + 1];
+            u_plane[y * uv_w + x] = enc_uv_plane[y * src_stride + x * 2];
+            v_plane[y * uv_w + x] = enc_uv_plane[y * src_stride + x * 2 + 1];
         }
     }
 
     const unsigned char *planes_in[3] = {
-        src->y_plane,
+        enc_y_plane,
         u_plane.data(),
         v_plane.data()
     };
@@ -1332,7 +2217,7 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
     unsigned char *jpeg_buf = nullptr;
     unsigned long  jpeg_sz  = 0;
 
-    int rc = tjCompressFromYUVPlanes(tj, planes_in, src_w, strides_in, src_h,
+    int rc = tjCompressFromYUVPlanes(tj, planes_in, enc_w, strides_in, enc_h,
                                      TJSAMP_420, &jpeg_buf, &jpeg_sz, 85, TJFLAG_FASTDCT);
     tjDestroy(tj);
 
@@ -1345,7 +2230,31 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
 
     void *vaddr = nullptr;
 
-    int err = g_lock(hwb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, fence_fd, nullptr, &vaddr);
+    int err = hwb ? g_lock(hwb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, fence_fd, nullptr, &vaddr) : -1;
+    bool mm_jpeg = false;
+    void *mm_jpeg_ptr = nullptr;
+    size_t mm_jpeg_sz = 0;
+    if ((err != 0 || !vaddr) && dmabuf_fd >= 0) {
+        /* [V17 photo fix] MTK A14: AHB lock of the BLOB fails (HIDL transport
+         * wrapper handle — resolve_ahwb EINVAL). mmap the dmabuf directly, the
+         * same way the YUV mmap fallback does. */
+        mm_jpeg_sz = (framework_blob_size + 4095) & ~(size_t)4095;
+        mm_jpeg_ptr = mmap(nullptr, mm_jpeg_sz, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, dmabuf_fd, 0);
+        if (mm_jpeg_ptr != MAP_FAILED) {
+            struct dma_buf_sync js = {};
+            js.flags = (uint64_t)(DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &js);
+            vaddr = mm_jpeg_ptr;
+            mm_jpeg = true;
+            err = 0;   /* [V22 PHOTO] fallback succeeded — stop reporting failure */
+            LOGI("inject_jpeg: [V17] AHB lock failed — dmabuf mmap fallback OK (%zu bytes)",
+                 mm_jpeg_sz);
+        } else {
+            LOGE("inject_jpeg: dmabuf mmap fallback FAILED: %s", strerror(errno));
+            mm_jpeg_ptr = nullptr;
+        }
+    }
     if (err != 0 || !vaddr) {
         LOGE("inject_jpeg: BLOB buffer lock FAILED err=%d", err);
         tjFree(jpeg_buf);
@@ -1393,10 +2302,17 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
     __sync_synchronize();
 
     int32_t release_fence_fd = -1;
-    g_unlock(hwb, &release_fence_fd);
+    if (mm_jpeg) {
+        struct dma_buf_sync je = {};
+        je.flags = (uint64_t)(DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &je);
+        munmap(mm_jpeg_ptr, mm_jpeg_sz);
+    } else {
+        g_unlock(hwb, &release_fence_fd);
+    }
 
     /* Qualcomm UBWC metadata invalidation workaround — same as inject_yuv */
-    if (g_lock) {
+    if (g_lock && hwb && platform_is_qcom()) {
         void *ubwc_touch = nullptr;
         int touch_rc = g_lock(hwb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
                               -1, nullptr, &ubwc_touch);
@@ -1417,7 +2333,7 @@ static bool inject_jpeg(AHardwareBuffer *hwb, const camera3_stream_buffer_t *buf
 
     tjFree(jpeg_buf);
 
-    LOGD("inject_jpeg: OK — JPEG %lu bytes written to framework_blob_size=%zu", jpeg_sz, framework_blob_size);
+    LOGI("inject_jpeg: OK — JPEG %lu bytes written to framework_blob_size=%zu (V11 snapshot trace)", jpeg_sz, framework_blob_size);
     return true;
 }
 
@@ -1434,14 +2350,53 @@ bool frame_inject_one(const camera3_stream_buffer_t *buf,
         return false;
     }
 
+    uint32_t dst_w = buf->stream ? buf->stream->width  : 0;
+    uint32_t dst_h = buf->stream ? buf->stream->height : 0;
+    int      fmt   = buf->stream ? buf->stream->format : HAL_PIXEL_FORMAT_BLOB;
+
+    /* [V20 photo fix] BLOB (JPEG) buffers carry HIDL transport wrapper handles
+     * on OPlus/MTK A14 — resolve_ahwb ALWAYS fails there (EINVAL x3 profiles)
+     * and aborted the whole injection before inject_jpeg ran, even though
+     * inject_jpeg only needs the dmabuf fd (null hwb is supported since the
+     * V18 PCR path). Fast-path BLOB straight to inject_jpeg. */
+    if (fmt == HAL_PIXEL_FORMAT_BLOB) {
+        uintptr_t nh_raw_b = (uintptr_t)(*buf->buffer);
+        if (nh_raw_b >> 56) nh_raw_b &= 0x00FFFFFFFFFFFFFFULL;
+        const native_handle_t *nhb = (const native_handle_t *)nh_raw_b;
+        /* [V22 PHOTO] Unisoc A13 (13.unisoc.1): data[0] of the BLOB handle is
+         * an 8KB METADATA blob — mmapping it "succeeded" then the write was
+         * abandoned (saved photo stayed real). Scan every fd in the handle and
+         * take the one with the LARGEST allocation: that is the JPEG data
+         * region (MBs), regardless of vendor fd ordering. */
+        int blob_fd = -1;
+        long blob_alloc = -1;
+        for (int fi = 0; nhb && fi < nhb->numFds; fi++) {
+            const int cand = nhb->data[fi];
+            if (cand < 0) continue;
+            const long sz = (long)lseek(cand, 0, SEEK_END);
+            if (sz > blob_alloc) { blob_alloc = sz; blob_fd = cand; }
+        }
+        if (blob_fd < 0) {
+            LOGE("frame_inject_one: BLOB has no dmabuf fd — cannot inject JPEG");
+            return false;
+        }
+        LOGI("frame_inject_one: [V22] BLOB handle fds=%d -> data fd=%d alloc=%ld",
+             nhb ? nhb->numFds : 0, blob_fd, blob_alloc);
+        camera3_stream_buffer_t *mb = const_cast<camera3_stream_buffer_t *>(buf);
+        int32_t in_fence = mb->release_fence;
+        mb->release_fence = -1;
+        int32_t out_fence = -1;
+        LOGI("frame_inject_one: BLOB fast-path → inject_jpeg fd=%d %ux%u fence=%d (V20)",
+             blob_fd, dst_w, dst_h, in_fence);
+        bool jok = inject_jpeg(nullptr, buf, src, in_fence, &out_fence, blob_fd);
+        if (out_fence >= 0) mb->release_fence = out_fence;
+        return jok;
+    }
+
     AHardwareBuffer *hwb = resolve_ahwb(buf);
     if (!hwb) {
         return false;
     }
-
-    uint32_t dst_w = buf->stream ? buf->stream->width  : 0;
-    uint32_t dst_h = buf->stream ? buf->stream->height : 0;
-    int      fmt   = buf->stream ? buf->stream->format : HAL_PIXEL_FORMAT_BLOB;
 
     if (dst_w == 0 || dst_h == 0) {
         LOGE("frame_inject_one: stream has zero dimensions (%ux%u)", dst_w, dst_h);
@@ -1473,7 +2428,7 @@ bool frame_inject_one(const camera3_stream_buffer_t *buf,
     bool ok = false;
     switch (fmt) {
         case HAL_PIXEL_FORMAT_BLOB:
-            LOGD("frame_inject_one: injecting JPEG (blob) stream %ux%u", dst_w, dst_h);
+            LOGI("frame_inject_one: injecting JPEG (blob) stream %ux%u (V11 snapshot trace)", dst_w, dst_h);
             ok = inject_jpeg(hwb, buf, src, incoming_fence, &downstream_fence, dmabuf_fd);
             break;
         case HAL_PIXEL_FORMAT_RAW16:
@@ -1488,8 +2443,9 @@ bool frame_inject_one(const camera3_stream_buffer_t *buf,
         case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED:
         case HAL_PIXEL_FORMAT_YCrCb_420_SP:
         default:
-            LOGD("frame_inject_one: injecting YUV stream fmt=0x%x %ux%u", fmt, dst_w, dst_h);
-            ok = inject_yuv(hwb, dst_w, dst_h, src, incoming_fence, &downstream_fence, dmabuf_fd);
+            LOGD("frame_inject_one: injecting YUV stream role=%d fmt=0x%x %ux%u",
+                 (int)role, fmt, dst_w, dst_h);
+            ok = inject_yuv(hwb, dst_w, dst_h, src, incoming_fence, &downstream_fence, dmabuf_fd, role);
             break;
     }
 

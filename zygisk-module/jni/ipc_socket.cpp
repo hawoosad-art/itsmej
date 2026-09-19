@@ -220,6 +220,8 @@ static void *ipc_thread(void *) {
     return nullptr;
 }
 
+static std::atomic<bool> g_ipc_thread_valid{false};
+
 int ipc_socket_start(void) {
     if (g_ipc_running.load()) return 0;
     g_ipc_running.store(true);
@@ -228,8 +230,10 @@ int ipc_socket_start(void) {
     if (r != 0) {
         LOGE("pthread_create(ipc_thread) failed: %s", strerror(r));
         g_ipc_running.store(false);
+        g_ipc_thread_valid.store(false);
         return -1;
     }
+    g_ipc_thread_valid.store(true);
     return 0;
 }
 
@@ -238,5 +242,7 @@ void ipc_socket_stop(void) {
     if (g_listen_fd >= 0) {
         shutdown(g_listen_fd, SHUT_RDWR);
     }
-    pthread_join(g_ipc_thread, nullptr);
+    if (g_ipc_thread_valid.exchange(false)) {
+        pthread_join(g_ipc_thread, nullptr);
+    }
 }

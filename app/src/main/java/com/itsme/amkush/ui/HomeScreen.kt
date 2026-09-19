@@ -41,8 +41,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import com.itsme.amkush.AppState
 import com.itsme.amkush.model.AppInfo
-import com.itsme.amkush.network.ApiClient
-import com.itsme.amkush.network.models.TokenRequest
 import com.itsme.amkush.security.LicenseGuard
 import com.itsme.amkush.services.InjectionService
 import com.itsme.amkush.utils.DeviceUtils
@@ -78,12 +76,162 @@ class HomeScreen : ComponentActivity() {
      SharedPrefs.init(this)
      setContent {
          var showAdmin     by remember { mutableStateOf(false) }
-         var showModeDialog by remember { mutableStateOf(!SharedPrefs.isModeSelected()) }
+         var showModeDialog by remember { mutableStateOf(false) }
          var rootCheckFailed by remember { mutableStateOf(false) }
          var modeChecking   by remember { mutableStateOf(false) }
+         var showLicensePopup by remember { mutableStateOf(false) }
+         var popupTargetApp by remember { mutableStateOf<AppInfo?>(null) }
+         var activationKey by remember { mutableStateOf("") }
+         var activationError by remember { mutableStateOf("") }
+         var activationLoading by remember { mutableStateOf(false) }
+         val coroutineScope = rememberCoroutineScope()
          val context = LocalContext.current
 
+         val proceedToDashboard: (AppInfo) -> Unit = { app ->
+             val intent = Intent(this@HomeScreen, TabsScreen::class.java).apply {
+                 putExtra("target_package", app.packageName)
+                 putExtra("target_app_name", app.appName)
+             }
+             startActivity(intent)
+         }
+
          val dialogScope = rememberCoroutineScope()
+
+         if (showLicensePopup) {
+             AlertDialog(
+                 onDismissRequest = { if (!activationLoading) showLicensePopup = false },
+                 containerColor = Color(0xFF16162A),
+                 shape = androidx.compose.foundation.shape.RoundedCornerShape(24.dp),
+                 tonalElevation = 0.dp,
+                 title = {
+                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                         Text("🔑", fontSize = 32.sp)
+                         Spacer(Modifier.height(8.dp))
+                         Text("License Required", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                         Spacer(Modifier.height(4.dp))
+                         Text("Please enter your activation key to continue", color = Color(0x88FFFFFF), fontSize = 12.sp, textAlign = TextAlign.Center)
+                     }
+                 },
+                 text = {
+                     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                         // Device ID Display
+                         Box(
+                             modifier = Modifier
+                                 .fillMaxWidth()
+                                 .clip(RoundedCornerShape(12.dp))
+                                 .background(Color(0x0AFFFFFF))
+                                 .border(1.dp, Color(0x14FFFFFF), RoundedCornerShape(12.dp))
+                                 .padding(12.dp)
+                         ) {
+                             Column {
+                                 Text("YOUR DEVICE ID (CLICK TO COPY)", color = Color(0x66FFFFFF), fontSize = 8.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
+                                 Spacer(Modifier.height(4.dp))
+                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                     val devId = remember { DeviceUtils.getFormattedDeviceId(context) }
+                                     Text(devId, color = Color.White, fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                     Box(
+                                         modifier = Modifier
+                                             .clip(RoundedCornerShape(8.dp))
+                                             .background(Color(0x333B82F6))
+                                             .clickable {
+                                                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                 cm.setPrimaryClip(android.content.ClipData.newPlainText("Device ID", devId))
+                                                 Toast.makeText(context, "Device ID copied!", Toast.LENGTH_SHORT).show()
+                                             }
+                                             .padding(horizontal = 10.dp, vertical = 5.dp)
+                                     ) {
+                                         Text("Copy", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                     }
+                                 }
+                             }
+                         }
+
+                         // Input Field
+                         Box(
+                             modifier = Modifier
+                                 .fillMaxWidth()
+                                 .clip(RoundedCornerShape(12.dp))
+                                 .background(Color(0x0DFFFFFF))
+                                 .border(1.dp, if (activationError.isNotEmpty()) Color(0x66EF4444) else Color(0x14FFFFFF), RoundedCornerShape(12.dp))
+                                 .padding(12.dp)
+                         ) {
+                             androidx.compose.foundation.text.BasicTextField(
+                                 value = activationKey,
+                                 onValueChange = {
+                                     activationKey = it
+                                     if (activationError.isNotEmpty()) activationError = ""
+                                 },
+                                 modifier = Modifier.fillMaxWidth(),
+                                 textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 14.sp, fontFamily = FontFamily.Monospace),
+                                 cursorBrush = SolidColor(Color.White),
+                                 decorationBox = { innerTextField ->
+                                     if (activationKey.isEmpty()) {
+                                         Text("Enter License Key...", color = Color(0x4DFFFFFF), fontSize = 14.sp, fontFamily = FontFamily.Monospace)
+                                     }
+                                     innerTextField()
+                                 }
+                             )
+                         }
+
+                         if (activationError.isNotEmpty()) {
+                             Text(activationError, color = Color(0xFFFF4D6D), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                         }
+                     }
+                 },
+                 confirmButton = {
+                     Box(
+                         modifier = Modifier
+                             .fillMaxWidth()
+                             .clip(RoundedCornerShape(14.dp))
+                             .background(Color(0xFF3B82F6))
+                             .clickable(enabled = !activationLoading) {
+                                 if (activationKey.trim().isEmpty()) {
+                                     activationError = "Please enter your license key"
+                                     return@clickable
+                                 }
+                                 activationLoading = true
+                                 activationError = ""
+                                 coroutineScope.launch(Dispatchers.IO) {
+                                     try {
+                                         val rawDeviceId = DeviceUtils.getDeviceId(context)
+                                         val result = LicenseGuard.validateKey(activationKey.trim(), rawDeviceId)
+                                         withContext(Dispatchers.Main) {
+                                             activationLoading = false
+                                             if (result.success && result.token != null) {
+                                                 SharedPrefs.setActivationToken(result.token)
+                                                 SharedPrefs.setTrial(result.isTrial)
+                                                 SharedPrefs.setPaid(!result.isTrial)
+                                                 val expiryMs = HomeViewModel.parseExpiryMs(result.expiresAt)
+                                                 if (result.isTrial) {
+                                                     if (expiryMs > 0) SharedPrefs.setTrialExpiry(expiryMs)
+                                                 }
+                                                 LicenseGuard.nativeSaveActivation(context, result.token, result.isTrial, expiryMs)
+                                                 Toast.makeText(context, "Activation successful!", Toast.LENGTH_LONG).show()
+                                                 showLicensePopup = false
+                                             } else {
+                                                 activationError = if (result.message.isNotEmpty()) result.message else "Invalid activation key"
+                                             }
+                                         }
+                                     } catch (e: Exception) {
+                                         withContext(Dispatchers.Main) {
+                                             activationLoading = false
+                                             activationError = "Activation error: " + e.message
+                                         }
+                                     }
+                                 }
+                             }
+                             .padding(vertical = 12.dp),
+                         contentAlignment = Alignment.Center
+                     ) {
+                         if (activationLoading) {
+                             CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                         } else {
+                             Text("Activate", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                         }
+                     }
+                 }
+             )
+         }
 
          if (showModeDialog) {
              AlertDialog(
@@ -96,7 +244,7 @@ class HomeScreen : ComponentActivity() {
                          Text("Select Operation Mode",
                              color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                          Spacer(Modifier.height(4.dp))
-                         Text("Choose how FaceGate will hook the camera",
+                         Text("Choose how EcomCam will hook the camera",
                              color = Color(0x88FFFFFF), fontSize = 12.sp,
                              textAlign = TextAlign.Center)
                      }
@@ -208,19 +356,10 @@ class HomeScreen : ComponentActivity() {
          } else {
              HomeScreenContent(
                  onShowAdmin = { showAdmin = true },
-                 onProceedToDashboard = { app ->
-                     val intent = Intent(this, TabsScreen::class.java).apply {
-                         putExtra("target_package", app.packageName)
-                         putExtra("target_app_name", app.appName)
-                     }
-                     startActivity(intent)
-                 },
+                 onProceedToDashboard = proceedToDashboard,
                  onProceedToPayment = { app ->
-                     val intent = Intent(this, PaymentScreen::class.java).apply {
-                         putExtra("target_package", app.packageName)
-                         putExtra("target_app_name", app.appName)
-                     }
-                     startActivity(intent)
+                     popupTargetApp = app
+                     showLicensePopup = true
                  }
              )
          }
@@ -260,7 +399,7 @@ return "Unavailable"
 private fun HomeScreenContent(
     onShowAdmin: () -> Unit,
     onProceedToDashboard: (AppInfo) -> Unit,
-    onProceedToPayment: (AppInfo) -> Unit
+    onProceedToPayment: (AppInfo?) -> Unit
 ) {
     val context = LocalContext.current
     var appList      by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
@@ -284,36 +423,29 @@ private fun HomeScreenContent(
         )
     }
 
+    // [V25] False until the first getStatus() returns; see the poll loop below.
+    var statusProbed by remember { mutableStateOf(false) }
     var isInjectingNow by remember { mutableStateOf(false) }
     var injectResultMsg by remember { mutableStateOf<String?>(null) }
-
-    // Anti-tamper: verified at app startup. If the signing cert is not the
-    // expected production one (repackaged/re-signed clone), show a red popup and
-    // exit after 10s, self-destructing local activation.
-    var tampered by remember { mutableStateOf(false) }
-    var tamperCountdown by remember { mutableStateOf(10) }
+    var resetting by remember { mutableStateOf(false) }
+    var showTutorial by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
-        val attestOk = withContext(Dispatchers.IO) {
-            try { LicenseGuard.nativeCheckAttestation() } catch (e: Exception) { true }
-        }
-        if (!attestOk) {
-            tampered = true
-            while (tamperCountdown > 0) {
-                delay(1000)
-                tamperCountdown -= 1
-            }
-            try {
-                SharedPrefs.clearActivation()
-                LicenseGuard.nativeClearActivation(context)
-            } catch (_: Exception) {}
-            android.os.Process.killProcess(android.os.Process.myPid())
-        }
+        delay(5000)
+        showTutorial = false
     }
 
+    // [V25] Probe status immediately on composition. moduleStatus starts as an
+    // all-false placeholder, and alreadyHooked derives from it — so before the
+    // first refresh landed, every cold start showed "INJECT" even when the hook
+    // was live inside cameraserver. getStatus() runs several root shells and
+    // takes ~1 s, so this still leaves a brief unprobed window; that is handled
+    // by statusProbed below, which keeps the button showing "…" instead of a
+    // wrong INJECT label.
     LaunchedEffect(Unit) {
         while (true) {
             moduleStatus = withContext(Dispatchers.IO) { moduleManager.getStatus() }
+            statusProbed = true
             delay(2000)
         }
     }
@@ -414,6 +546,11 @@ private fun HomeScreenContent(
             InjectionService.stop(context)
             isInjecting.value = false
         }
+        resetting = true
+        contentScope.launch {
+            delay(1600)
+            resetting = false
+        }
         Toast.makeText(context, "System reset", Toast.LENGTH_SHORT).show()
     }
     fun openTelegram() {
@@ -428,31 +565,10 @@ private fun HomeScreenContent(
         val app = selectedApp ?: run { showAppList = true; return }
         locking = true
         CoroutineScope(Dispatchers.IO).launch {
-            val token = SharedPrefs.getActivationToken()
-            if (!token.isNullOrEmpty()) {
-                try {
-                    val deviceId = DeviceUtils.getDeviceId(context)
-                    val request  = TokenRequest(token, deviceId)
-                    val response = ApiClient.getApiService().verifyToken(request).execute()
-                    withContext(Dispatchers.Main) {
-                        locking = false
-                        if (response.isSuccessful && response.body()?.valid == true) {
-                            onProceedToDashboard(app)
-                        } else {
-                            onProceedToPayment(app)
-                        }
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        locking = false
-                        onProceedToPayment(app)
-                    }
-                }
-            } else {
-                withContext(Dispatchers.Main) {
-                    locking = false
-                    onProceedToPayment(app)
-                }
+            val active = runCatching { LicenseGuard.nativeIsActivated(context) }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                locking = false
+                if (active) onProceedToDashboard(app) else onProceedToPayment(app)
             }
         }
     }
@@ -481,19 +597,29 @@ private fun HomeScreenContent(
                     moduleStatus = moduleStatus,
                     isInjectingNow = isInjectingNow,
                     injectResultMsg = injectResultMsg,
+                    showTutorial = showTutorial,
+                    statusProbed = statusProbed,
                     onInjectClick = {
                         injectResultMsg = null
                         isInjectingNow = true
-                        contentScope.launch {
-                            val result = moduleManager.injectNow()
-                            val newStatus = withContext(Dispatchers.IO) { moduleManager.getStatus() }
-                            withContext(Dispatchers.Main) {
-                                isInjectingNow = false
-                                moduleStatus = newStatus
-                                injectResultMsg = result.fold(
-                                    onSuccess = { "Injected into cameraserver PID " + newStatus.cameraserverPid },
-                                    onFailure = { it.message ?: "Injection failed" }
-                                )
+                        contentScope.launch(Dispatchers.IO) {
+                            val active = runCatching { LicenseGuard.nativeIsActivated(context) }.getOrDefault(false)
+                            if (active) {
+                                val result = moduleManager.injectNow()
+                                val newStatus = moduleManager.getStatus()
+                                withContext(Dispatchers.Main) {
+                                    isInjectingNow = false
+                                    moduleStatus = newStatus
+                                    injectResultMsg = result.fold(
+                                        onSuccess = { "INJECTED SUCCESSFULLY" },
+                                        onFailure = { it.message ?: "Injection failed" }
+                                    )
+                                }
+                            } else {
+                                withContext(Dispatchers.Main) {
+                                    isInjectingNow = false
+                                    onProceedToPayment(selectedApp)
+                                }
                             }
                         }
                     }
@@ -515,12 +641,14 @@ private fun HomeScreenContent(
                 )
                 ActionButtonsSection(
                     hookActive = moduleStatus.active,
+                    resetting = resetting,
                     onRestart = ::handleRestart,
                     onSupport = ::openTelegram
                 )
                 Spacer(Modifier.height(80.dp))
             }
         }
+
         BottomHookButton(
             selectedApp = selectedApp,
             locking = locking,
@@ -534,61 +662,6 @@ private fun HomeScreenContent(
             InjectionWaitingOverlay()
         }
 
-        // Red "tampered" popup — shown at startup on a repackaged/re-signed clone.
-        if (tampered) {
-            TamperDetectedOverlay(countdown = tamperCountdown)
-        }
-    }
-}
-
-@Composable
-private fun TamperDetectedOverlay(countdown: Int) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xE6000000))
-            .clickable(enabled = false) { },
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth(0.88f)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color(0xFF1A0505))
-                .border(1.dp, Color(0xFFFF1744), RoundedCornerShape(20.dp))
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(56.dp)
-                    .clip(CircleShape)
-                    .background(Color(0x33FF1744)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("⚠️", fontSize = 28.sp)
-            }
-            Text(
-                "TAMPER DETECTED",
-                color = Color(0xFFFF1744),
-                fontSize = 18.sp,
-                fontWeight = FontWeight.ExtraBold,
-                letterSpacing = 1.5.sp
-            )
-            Text(
-                "This app has been tampered with / repackaged.",
-                color = Color(0xFFE2E8F0),
-                fontSize = 13.sp,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                "The app will exit in $countdown s and destroy itself.",
-                color = Color(0xFF94A3B8),
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center
-            )
-        }
     }
 }
 
@@ -709,7 +782,7 @@ private fun HomeTopBar(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        "FG",
+                        "EC",
                         color = Color.White,
                         fontWeight = FontWeight.Black,
                         fontSize = 16.sp,
@@ -719,7 +792,7 @@ private fun HomeTopBar(
             }
             Column {
                 Text(
-                    "FACEGATE",
+                    "ECOMCAM",
                     color = Color.White,
                     fontWeight = FontWeight.Black,
                     fontSize = 18.sp,
@@ -1121,9 +1194,20 @@ private fun AppListRow(
 @Composable
 private fun ActionButtonsSection(
     hookActive: Boolean,
+    resetting: Boolean,
     onRestart: () -> Unit,
     onSupport: () -> Unit
 ) {
+
+    // Spin the reset glyph while a reset is in progress.
+    val resetRotation by rememberInfiniteTransition(label = "resetSpin").animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing)
+        ),
+        label = "resetRotation"
+    )
 
     Box(
         modifier = Modifier
@@ -1133,7 +1217,7 @@ private fun ActionButtonsSection(
             .background(Color(0xFF0F1624))
             .border(1.dp, Cyan.copy(alpha = if (hookActive) 0.25f else 0.10f), RoundedCornerShape(16.dp))
             .alpha(if (hookActive) 1f else 0.45f)
-            .clickable(enabled = hookActive) { onRestart() },
+            .clickable(enabled = hookActive && !resetting) { onRestart() },
         contentAlignment = Alignment.Center
     ) {
         Row(
@@ -1141,10 +1225,14 @@ private fun ActionButtonsSection(
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
 
-            Canvas(modifier = Modifier.size(18.dp)) {
+            Canvas(
+                modifier = Modifier
+                    .size(18.dp)
+                    .rotate(if (resetting) resetRotation else 0f)
+            ) {
                 val r = size.minDimension * 0.38f
                 drawArc(
-                    color = Cyan,
+                    color = if (resetting) OrangeWait else Cyan,
                     startAngle = -30f,
                     sweepAngle = 270f,
                     useCenter = false,
@@ -1155,12 +1243,12 @@ private fun ActionButtonsSection(
 
                 val tipX = size.width / 2f + r
                 val tipY = size.height / 2f
-                drawLine(Cyan, Offset(tipX - 4f, tipY - 4f), Offset(tipX, tipY), strokeWidth = 2.5f)
-                drawLine(Cyan, Offset(tipX - 4f, tipY + 4f), Offset(tipX, tipY), strokeWidth = 2.5f)
+                drawLine(if (resetting) OrangeWait else Cyan, Offset(tipX - 4f, tipY - 4f), Offset(tipX, tipY), strokeWidth = 2.5f)
+                drawLine(if (resetting) OrangeWait else Cyan, Offset(tipX - 4f, tipY + 4f), Offset(tipX, tipY), strokeWidth = 2.5f)
             }
             Text(
-                "Restart System",
-                color = Cyan,
+                if (resetting) "Resetting..." else "Restart System",
+                color = if (resetting) OrangeWait else Cyan,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp
             )
@@ -1318,15 +1406,18 @@ val accentColor: Color
 )
 
 private fun adminLinks(): List <AdminLink > = listOf(
-AdminLink( "🤖 ",  "Official FaceGate Bot ",  "@Facegateofficialbot ",
+AdminLink( "🤖 ",  "Official EcomCam Bot ",  "@EcomCamBot ",
 try { LicenseGuard.nativeGetTgBot()     } catch (e: Throwable) {  " " },
  "Verified Bot ",  Color(0xFF00AAFF)),
-AdminLink( "📢 ",  "Official Channel ",        "@+Tx-rhbl-VcgyNDg0 ",
+AdminLink( "📢 ",  "Official Channel ",        "@EcommerceBeast ",
 try { LicenseGuard.nativeGetTgChannel() } catch (e: Throwable) {  " " },
  "Announcements ", Color(0xFFAA44FF)),
-AdminLink( " ",  "Owner ",                   "@facegateofficial ",
+AdminLink( "👤 ",  "Owner ",                   "@swishy_xd ",
 try { LicenseGuard.nativeGetTgOwner()   } catch (_: Throwable) {  " " },
  "Administrator ", Color(0xFF00CC88)),
+AdminLink( "👤 ",  "Second Owner ",            "@OAmkushO ",
+ "https://t.me/OAmkushO",
+ "Administrator ", Color(0xFFFF8C00)),
 )
 
 @Composable
@@ -1532,7 +1623,7 @@ var showTrialModal by remember { mutableStateOf(false) }
              verticalArrangement = Arrangement.spacedBy(12.dp)
          ) {
              Text(
-                 "Scammers are circulating infected FaceGate apps.",
+                 "Scammers are circulating infected EcomCam apps.",
                  color = Color(0xE6FFFFFF),
                  fontSize = 13.sp,
                  fontWeight = FontWeight.Medium,
@@ -1567,7 +1658,7 @@ var showTrialModal by remember { mutableStateOf(false) }
                      drawCircle(Color(0xFFEAB308), 2f, Offset(size.width * 0.5f, size.height * 0.78f))
                  }
                  Text(
-                     "DO NOT INSTALL PC VERSIONS. FaceGate.exe / Kima.exe / .msi files are VIRUSES.",
+                     "DO NOT INSTALL PC VERSIONS. EcomCam.exe / Kima.exe / .msi files are VIRUSES.",
                      color = Color(0xD9FFFFFF),
                      fontSize = 13.sp,
                      modifier = Modifier.weight(1f)
@@ -1582,7 +1673,7 @@ var showTrialModal by remember { mutableStateOf(false) }
                      .padding(horizontal = 16.dp, vertical = 12.dp)
              ) {
                  Text(
-                     "UPDATES are broadcast through the official FaceGate bot only.",
+                     "UPDATES are broadcast through the official EcomCam bot only.",
                      color = CyanText,
                      fontSize = 13.sp,
                      modifier = Modifier.fillMaxWidth()
@@ -1590,187 +1681,6 @@ var showTrialModal by remember { mutableStateOf(false) }
              }
          }
          Spacer(Modifier.height(24.dp))
-
-         val purpleAccent = Color(0xFFA050FF)
-         val purpleLight  = Color(0xFFC080FF)
-         Column(
-             modifier = Modifier
-                 .fillMaxWidth()
-                 .clip(RoundedCornerShape(20.dp))
-                 .background(
-                     Brush.linearGradient(listOf(Color(0xF80F0A1E), Color(0xF20A081A)))
-                 )
-                 .border(1.dp, Color(0x40A050FF), RoundedCornerShape(20.dp))
-                 .padding(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 22.dp)
-         ) {
-
-             Row(
-                 verticalAlignment = Alignment.CenterVertically,
-                 horizontalArrangement = Arrangement.spacedBy(12.dp),
-                 modifier = Modifier.padding(bottom = 12.dp)
-             ) {
-                 Box(
-                     modifier = Modifier
-                         .size(36.dp)
-                         .clip(RoundedCornerShape(10.dp))
-                         .background(Color(0x40A050FF))
-                         .border(1.dp, Color(0x66A050FF), RoundedCornerShape(10.dp)),
-                     contentAlignment = Alignment.Center
-                 ) {
-                     Canvas(Modifier.size(18.dp)) {
-                         drawCircle(purpleAccent, radius = size.minDimension / 2f - 2f,
-                             style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.5f * density))
-                         drawLine(purpleAccent, Offset(size.width/2f, size.height*0.27f),
-                             Offset(size.width/2f, size.height*0.58f), 3.5f * density,
-                             cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                         drawLine(purpleAccent, Offset(size.width/2f, size.height*0.58f),
-                             Offset(size.width*0.72f, size.height*0.72f), 3.5f * density,
-                             cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                     }
-                 }
-                 Column(Modifier.weight(1f)) {
-                     Text("Free Trial Available", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
-                     Text("● 1 Hour Free Access", color = purpleAccent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-                 }
-                 Box(
-                     modifier = Modifier
-                         .clip(CircleShape)
-                         .background(Color(0x1EA050FF))
-                         .border(1.dp, Color(0x4DA050FF), CircleShape)
-                         .padding(horizontal = 10.dp, vertical = 4.dp)
-                 ) {
-                     Text("FREE", color = purpleAccent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
-                 }
-             }
-             Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0x1AA050FF)))
-             Spacer(Modifier.height(12.dp))
-
-             Box(
-                 modifier = Modifier
-                     .fillMaxWidth()
-                     .clip(RoundedCornerShape(12.dp))
-                     .background(Color(0x0FA050FF))
-                     .border(1.dp, Color(0x26A050FF), RoundedCornerShape(12.dp))
-                     .padding(horizontal = 16.dp, vertical = 12.dp)
-             ) {
-                 Text(
-                     "Try FaceGate free for 1 hour before committing to a purchase. Full access, no limitations.",
-                     color = Color(0xCCFFFFFF), fontSize = 13.sp, textAlign = TextAlign.Center,
-                     modifier = Modifier.fillMaxWidth()
-                 )
-             }
-             Spacer(Modifier.height(12.dp))
-
-             listOf(
-                 "Full access to all FaceGate features",
-                 "No payment required to start",
-                 "Upgrade anytime during or after trial"
-             ).forEach { text ->
-                 Row(
-                     verticalAlignment = Alignment.CenterVertically,
-                     horizontalArrangement = Arrangement.spacedBy(12.dp),
-                     modifier = Modifier.padding(vertical = 6.dp)
-                 ) {
-                     CheckBullet(purpleAccent)
-                     Text(text, color = Color(0xB3FFFFFF), fontSize = 12.sp)
-                 }
-             }
-             Spacer(Modifier.height(16.dp))
-
-             Box(
-                 modifier = Modifier
-                     .fillMaxWidth()
-                     .clip(RoundedCornerShape(12.dp))
-                     .background(
-                         Brush.linearGradient(listOf(Color(0x4DA050FF), Color(0x333222DC)))
-                     )
-                     .border(1.dp, Color(0x73A050FF), RoundedCornerShape(12.dp))
-                     .clickable { showTrialModal = true }
-                     .padding(vertical = 14.dp),
-                 contentAlignment = Alignment.Center
-             ) {
-                 Text("Start 1-Hour Free Trial", color = purpleLight,
-                     fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
-             }
-         }
-         Spacer(Modifier.height(24.dp))
-
-         val greenAccent = Color(0xFF00C864)
-         Column(
-             modifier = Modifier
-                 .fillMaxWidth()
-                 .clip(RoundedCornerShape(20.dp))
-                 .background(
-                     Brush.linearGradient(listOf(Color(0xF8051915), Color(0xF2051410)))
-                 )
-                 .border(1.dp, Color(0x4000C864), RoundedCornerShape(20.dp))
-                 .padding(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 22.dp)
-         ) {
-
-             Row(
-                 verticalAlignment = Alignment.CenterVertically,
-                 horizontalArrangement = Arrangement.spacedBy(12.dp),
-                 modifier = Modifier.padding(bottom = 12.dp)
-             ) {
-                 Box(
-                     modifier = Modifier
-                         .size(36.dp)
-                         .clip(RoundedCornerShape(10.dp))
-                         .background(Color(0x3300C864))
-                         .border(1.dp, Color(0x5900C864), RoundedCornerShape(10.dp)),
-                     contentAlignment = Alignment.Center
-                 ) {
-                     Canvas(Modifier.size(18.dp)) {
-
-                         val W = size.width; val H = size.height
-                         val sp = Path().apply {
-                             moveTo(W*0.5f, H*0.05f)
-                             lineTo(W*0.94f, H*0.22f)
-                             lineTo(W*0.94f, H*0.56f)
-                             cubicTo(W*0.94f, H*0.79f, W*0.74f, H*0.94f, W*0.5f, H*0.99f)
-                             cubicTo(W*0.26f, H*0.94f, W*0.06f, H*0.79f, W*0.06f, H*0.56f)
-                             lineTo(W*0.06f, H*0.22f)
-                             close()
-                         }
-                         drawPath(sp, greenAccent.copy(alpha = 0.1f))
-                         drawPath(sp, greenAccent, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.5f * density))
-
-                         drawLine(greenAccent, Offset(W*0.32f, H*0.52f), Offset(W*0.47f, H*0.67f), 3f * density, cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                         drawLine(greenAccent, Offset(W*0.47f, H*0.67f), Offset(W*0.70f, H*0.38f), 3f * density, cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                     }
-                 }
-                 Column(Modifier.weight(1f)) {
-                     Text("App Integrity Verified", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
-                     Text("● Untampered", color = greenAccent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-                 }
-                 Box(
-                     modifier = Modifier
-                         .clip(CircleShape)
-                         .background(Color(0x1E00C864))
-                         .border(1.dp, Color(0x4D00C864), CircleShape)
-                         .padding(horizontal = 10.dp, vertical = 4.dp)
-                 ) {
-                     Text("SECURE", color = greenAccent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
-                 }
-             }
-             Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0x1A00C864)))
-             Spacer(Modifier.height(12.dp))
-             listOf(
-                 "Digital signature matches official release",
-                 "No unauthorized modifications detected",
-                 "Checksum verified against official build"
-             ).forEach { text ->
-                 Row(
-                     verticalAlignment = Alignment.CenterVertically,
-                     horizontalArrangement = Arrangement.spacedBy(12.dp),
-                     modifier = Modifier.padding(vertical = 6.dp)
-                 ) {
-                     CheckBullet(greenAccent)
-                     Text(text, color = Color(0xB3FFFFFF), fontSize = 12.sp)
-                 }
-             }
-         }
-         Spacer(Modifier.height(28.dp))
 
          Row(
              verticalAlignment = Alignment.CenterVertically,
@@ -2005,6 +1915,8 @@ private fun ModuleStatusCard(
     moduleStatus: ModuleManager.ModuleStatus,
     isInjectingNow: Boolean = false,
     injectResultMsg: String? = null,
+    showTutorial: Boolean = false,
+    statusProbed: Boolean = true,
     onInjectClick: () -> Unit
 ) {
     Column(
@@ -2078,21 +1990,87 @@ private fun ModuleStatusCard(
                         }
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-
-
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (showTutorial && !moduleStatus.active && !isInjectingNow) {
+                            val infiniteTransition = rememberInfiniteTransition(label = "tutorialSlide")
+                            val translationX by infiniteTransition.animateFloat(
+                                initialValue = -8f,
+                                targetValue = 2f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(600, easing = EaseInOutQuad),
+                                    repeatMode = RepeatMode.Reverse
+                                ),
+                                label = "tutorialX"
+                            )
+                            val alpha by infiniteTransition.animateFloat(
+                                initialValue = 0.6f,
+                                targetValue = 1f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(600),
+                                    repeatMode = RepeatMode.Reverse
+                                ),
+                                label = "tutorialAlpha"
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .graphicsLayer(translationX = translationX, alpha = alpha)
+                                    .background(Color(0xE616162A), RoundedCornerShape(8.dp))
+                                    .border(1.dp, Color(0xFF00FFFF), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    "Tap to Inject",
+                                    color = Color(0xFF00FFFF),
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Canvas(Modifier.size(10.dp)) {
+                                    val sizePx = 3.dp.toPx()
+                                    val strokeWidthPx = 1.5.dp.toPx()
+                                    val path = Path().apply {
+                                        moveTo(0f, size.height / 2f)
+                                        lineTo(size.width, size.height / 2f)
+                                        lineTo(size.width - sizePx, size.height / 2f - sizePx)
+                                        moveTo(size.width, size.height / 2f)
+                                        lineTo(size.width - sizePx, size.height / 2f + sizePx)
+                                    }
+                                    drawPath(
+                                        path = path,
+                                        color = Color(0xFF00FFFF),
+                                        style = androidx.compose.ui.graphics.drawscope.Stroke(
+                                            width = strokeWidthPx,
+                                            cap = StrokeCap.Round,
+                                            join = StrokeJoin.Round
+                                        )
+                                    )
+                                }
+                            }
+                        }
 
                         val alreadyHooked = moduleStatus.hookMapsLine.isNotEmpty()
+                        // [V25] Until the first status probe returns we don't know
+                        // whether the hook is live, so don't claim either state.
+                        val statusUnknown = !statusProbed && !alreadyHooked
                         val injectColor = when {
                             isInjectingNow -> OrangeWait
                             alreadyHooked  -> GreenOk
+                            statusUnknown  -> OrangeWait
                             else           -> Color(0xFF5588FF)
                         }
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(injectColor.copy(alpha = 0.15f))
-                                .border(1.dp, injectColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                .border(
+                                    width = if (showTutorial && !moduleStatus.active) 1.5.dp else 1.dp,
+                                    color = if (showTutorial && !moduleStatus.active) Color(0xFF00FFFF) else injectColor.copy(alpha = 0.4f),
+                                    shape = RoundedCornerShape(8.dp)
+                                )
                                 .clickable(enabled = !isInjectingNow && !alreadyHooked) { onInjectClick() }
                                 .padding(horizontal = 10.dp, vertical = 6.dp),
                             contentAlignment = Alignment.Center
@@ -2112,7 +2090,14 @@ private fun ModuleStatusCard(
                                 }
                             } else {
                                 Text(
-                                    if (alreadyHooked) "ACTIVE" else "INJECT",
+                                    // [V25] "…" while the first probe is still in
+                                    // flight, so a cold start can't flash INJECT
+                                    // over a genuinely ACTIVE hook.
+                                    when {
+                                        alreadyHooked -> "ACTIVE"
+                                        statusUnknown -> "…"
+                                        else          -> "INJECT"
+                                    },
                                     color = injectColor,
                                     fontSize = 9.sp,
                                     fontWeight = FontWeight.Bold,
@@ -2130,7 +2115,7 @@ private fun ModuleStatusCard(
 
                 val infoRows = buildList {
                     add("Manager" to (moduleStatus.manager ?: "None"))
-                    add("Version" to (moduleStatus.moduleVersion.ifEmpty { "-" }))
+                    add("Version" to com.itsme.amkush.utils.DeviceUtils.INJECTOR_VERSION)
                     add("Cameraserver" to moduleStatus.cameraserverPid)
                     if (moduleStatus.crashCount > 0) add("Crashes" to "${moduleStatus.crashCount}")
                     if (moduleStatus.hookMapsLine.isNotEmpty()) {
