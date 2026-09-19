@@ -1,0 +1,38 @@
+# ── Module file access ────────────────────────────────────────────────────────
+# Magisk labels module files as magisk_file.
+# KernelSU/APatch use OverlayFS — system/ overlay files inherit system_file.
+
+allow cameraserver magisk_file file { read open getattr execute map }
+allow cameraserver magisk_file dir { read open search getattr }
+
+allow cameraserver system_file file { read open getattr execute map }
+allow cameraserver system_file dir { read open search getattr }
+
+allow cameraserver unlabeled file { read open getattr execute map }
+allow cameraserver unlabeled dir { read open search getattr }
+
+# ── ptrace-based injection ────────────────────────────────────────────────────
+# amkush_injector (AndKittyInjector --pid) runs as root shell / magisk domain
+# and ptrace-attaches to cameraserver to remote-dlopen libhookProxy.so.
+# This replaces LD_PRELOAD + noatsecure which cannot be granted on Android 10+.
+allow su      cameraserver process { ptrace }
+allow shell   cameraserver process { ptrace }
+allow magisk  cameraserver process { ptrace }
+
+# Injector needs to read cameraserver's memory maps / fd table during injection.
+allow su    cameraserver dir  { search read open getattr }
+allow su    cameraserver file { read open getattr map }
+allow shell cameraserver dir  { search read open getattr }
+allow shell cameraserver file { read open getattr map }
+
+# ── SELinux self-management (service.sh reads/writes /sys/fs/selinux/enforce) ─
+# Allow root shell to toggle SELinux enforcing during injection.
+allow su kernel security { setenforce }
+
+# ── App-to-cameraserver IPC via Unix socket ──────────────────────────────────
+allow untrusted_app cameraserver unix_stream_socket { connectto }
+allow cameraserver  untrusted_app unix_stream_socket { read write accept }
+
+# ── cameraserver accessing module data paths ──────────────────────────────────
+allow cameraserver adb_data_file file { read open getattr execute map }
+allow cameraserver adb_data_file dir  { read open search getattr }
