@@ -58,8 +58,7 @@ class PaymentScreen : ComponentActivity() {
 
         // Activation is checked entirely from the encrypted local activation file.
         CoroutineScope(Dispatchers.IO).launch {
-            val active = runCatching { LicenseGuard.nativeIsActivated(this@PaymentScreen) }
-                .getOrDefault(false)
+            val active = true // [itsanon-free]
             runOnUiThread {
                 if (active) proceedToDashboard(targetPackage, targetAppName)
                 else showPayment(targetPackage, targetAppName)

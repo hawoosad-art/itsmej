@@ -61,30 +61,26 @@ object LicenseGuard {
         val message: String
     )
 
+    // ── [itsanon-free] license purchase gate removed ──────────────────────
+    // Every activation check succeeds locally: no server, no key, no payment.
+    fun isActivated(context: Context): Boolean = true
+
     fun validateKey(key: String, deviceId: String, wifiIp: String? = null): ActivationResult =
-        try {
-            val j = JSONObject(nativeValidateKey(key, deviceId, wifiIp))
-            ActivationResult(
-                success   = j.optBoolean("success"),
-                token     = j.optString("token").takeIf { it.isNotEmpty() && it != "null" },
-                isTrial   = j.optBoolean("is_trial"),
-                expiresAt = j.optString("expires_at").takeIf { it.isNotEmpty() && it != "null" },
-                message   = j.optString("message", "Unknown activation error")
-            )
-        } catch (error: Throwable) {
-            ActivationResult(false, null, false, null, error.message ?: "Activation error")
-        }
+        // [itsanon-free] no server, no key check — instant local activation
+        ActivationResult(
+            success = true,
+            token = "free-build-local",
+            isTrial = false,
+            expiresAt = null,
+            message = "Free build — no license required"
+        )
 
     fun verifyToken(token: String, deviceId: String): VerifyResult =
-        try {
-            val j = JSONObject(nativeVerifyToken(token, deviceId))
-            VerifyResult(
-                valid     = j.optBoolean("valid"),
-                isTrial   = j.optBoolean("is_trial"),
-                expiresAt = j.optString("expires_at").takeIf { it.isNotEmpty() && it != "null" },
-                message   = j.optString("message", "Unknown activation error")
-            )
-        } catch (error: Throwable) {
-            VerifyResult(false, false, null, error.message ?: "Activation error")
-        }
+        // [itsanon-free] heartbeat can never revoke the activation
+        VerifyResult(
+            valid = true,
+            isTrial = false,
+            expiresAt = null,
+            message = "Free build — always valid"
+        )
 }

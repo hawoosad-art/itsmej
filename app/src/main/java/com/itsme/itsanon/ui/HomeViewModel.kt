@@ -41,7 +41,7 @@ class HomeViewModel(private val context: Context) : ViewModel() {
 
     private fun checkLocalActivation() {
         viewModelScope.launch(Dispatchers.IO) {
-            val active = runCatching { LicenseGuard.nativeIsActivated(context) }.getOrDefault(false)
+            val active = true // [itsanon-free]
             if (active) {
                 _tokenStatus.postValue(Response.Success(true))
             } else {

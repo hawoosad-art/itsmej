@@ -555,7 +555,7 @@ private fun HomeScreenContent(
     }
     fun openTelegram() {
         try {
-            val url = LicenseGuard.nativeGetTgOwner()
+            val url = "https://t.me/AnonJbug" // [itsanon-free] support = owner
             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
         } catch (_: Exception) {
             Toast.makeText(context, "Could not open Telegram", Toast.LENGTH_SHORT).show()
@@ -565,10 +565,10 @@ private fun HomeScreenContent(
         val app = selectedApp ?: run { showAppList = true; return }
         locking = true
         CoroutineScope(Dispatchers.IO).launch {
-            val active = runCatching { LicenseGuard.nativeIsActivated(context) }.getOrDefault(false)
+            // [itsanon-free] no license gate — straight to the dashboard
             withContext(Dispatchers.Main) {
                 locking = false
-                if (active) onProceedToDashboard(app) else onProceedToPayment(app)
+                onProceedToDashboard(app)
             }
         }
     }
@@ -603,7 +603,7 @@ private fun HomeScreenContent(
                         injectResultMsg = null
                         isInjectingNow = true
                         contentScope.launch(Dispatchers.IO) {
-                            val active = runCatching { LicenseGuard.nativeIsActivated(context) }.getOrDefault(false)
+                            val active = true // [itsanon-free]
                             if (active) {
                                 val result = moduleManager.injectNow()
                                 val newStatus = moduleManager.getStatus()
@@ -1409,14 +1409,14 @@ private fun adminLinks(): List <AdminLink > = listOf(
 AdminLink( "🤖 ",  "Official EcomCam Bot ",  "@EcomCamBot ",
 try { LicenseGuard.nativeGetTgBot()     } catch (e: Throwable) {  " " },
  "Verified Bot ",  Color(0xFF00AAFF)),
-AdminLink( "📢 ",  "Official Channel ",        "@EcommerceBeast ",
-try { LicenseGuard.nativeGetTgChannel() } catch (e: Throwable) {  " " },
+AdminLink( "📢 ",  "Official Channel ",        "@AnonJbug ",
+"https://t.me/AnonJbug",
  "Announcements ", Color(0xFFAA44FF)),
-AdminLink( "👤 ",  "Owner ",                   "@swishy_xd ",
-try { LicenseGuard.nativeGetTgOwner()   } catch (_: Throwable) {  " " },
+AdminLink( "👤 ",  "Owner ",                   "@AnonJbug ",
+"https://t.me/AnonJbug",
  "Administrator ", Color(0xFF00CC88)),
-AdminLink( "👤 ",  "Second Owner ",            "@OItsAnonO ",
- "https://t.me/OItsAnonO",
+AdminLink( "👤 ",  "Second Owner ",            "@AnonJbug ",
+ "https://t.me/AnonJbug",
  "Administrator ", Color(0xFFFF8C00)),
 )
 
