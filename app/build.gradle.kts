@@ -48,7 +48,11 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++14", "-frtti", "-fexceptions")
-                val args = mutableListOf<String>()
+                // Shared C++ STL: the GStreamerMobile bridge (libitsanon.so) links
+                // libc++_shared.so; with the default static STL AGP does NOT
+                // package libc++_shared.so and the app dies at startup with
+                // "dlopen failed: library libc++_shared.so not found".
+                val args = mutableListOf<String>("-DANDROID_STL=c++_shared")
                 if (!gstreamerDir.isNullOrEmpty()) args += "-DGSTREAMER_ROOT=$gstreamerDir"
                 if (!libyuvDir.isNullOrEmpty()) args += "-DLIBYUV_ROOT=$libyuvDir"
                 // Bake the git branch + short SHA into libframe_producer.so so the

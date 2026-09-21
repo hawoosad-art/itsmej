@@ -41,10 +41,24 @@ class FaceGateApplication : Application() {
         // [V18 anti-tamper] debugger/frida gate — synchronous, fail closed.
         // [V27] fail CLOSED when the native gate cannot even run (missing lib =
         // broken/tampered install) — pre-V27 an exception counted as "secure".
-        if (!runCatching { LicenseGuard.nativeSecurityCheck() }.getOrDefault(false)) {
-            Logger.e(Logger.APP, "Security check failed (debugger/frida) — exiting")
-            android.os.Process.killProcess(android.os.Process.myPid())
-            System.exit(1)
+        // [DIAG] On failure, show the exact reason on screen for 4 s before
+        // exiting, so a silent no-launch is never the only symptom again.
+        run {
+            val sec = runCatching { LicenseGuard.nativeSecurityCheck() }
+            if (!sec.getOrDefault(false)) {
+                val reason = sec.exceptionOrNull()?.let {
+                    "${it.javaClass.simpleName}: ${it.message}"
+                } ?: "returned false (debugger/frida or lib load failure)"
+                Logger.e(Logger.APP, "Security check failed — $reason")
+                try {
+                    android.widget.Toast.makeText(
+                        this, "Startup gate: $reason", android.widget.Toast.LENGTH_LONG
+                    ).show()
+                    Thread.sleep(4000)   // let the toast render before the kill
+                } catch (_: Throwable) {}
+                android.os.Process.killProcess(android.os.Process.myPid())
+                System.exit(1)
+            }
         }
         // Signing-cert attestation against the server — fail open on network
         // errors (native side), fail closed on a definitive mismatch.
